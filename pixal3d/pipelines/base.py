@@ -66,7 +66,7 @@ class Pipeline:
             model.to(device)
 
     def cuda(self) -> None:
-        self.to(torch.device("cuda"))
+        self.to(torch.device("mps") if torch.backends.mps.is_available() else torch.device("cuda"))
 
     def cpu(self) -> None:
         self.to(torch.device("cpu"))
