@@ -20,6 +20,77 @@ from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 
 
+PROJ_FEATURE_MODES = ("concat", "low_only", "high_only")
+
+
+def validate_proj_feature_mode(mode: str) -> str:
+    if mode not in PROJ_FEATURE_MODES:
+        choices = ", ".join(PROJ_FEATURE_MODES)
+        raise ValueError(f"proj_feature_mode must be one of {choices}; got {mode!r}")
+    return mode
+
+
+def combine_projected_features(
+    z_proj_lr: torch.Tensor,
+    z_proj_hr: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    mode = validate_proj_feature_mode(mode)
+    if z_proj_lr.shape != z_proj_hr.shape:
+        raise ValueError(
+            "Low- and high-resolution projected features must have matching shapes; "
+            f"got {tuple(z_proj_lr.shape)} and {tuple(z_proj_hr.shape)}."
+        )
+    if mode == "concat":
+        low, high = z_proj_lr, z_proj_hr
+    elif mode == "low_only":
+        low, high = z_proj_lr, torch.zeros_like(z_proj_hr)
+    else:
+        low, high = torch.zeros_like(z_proj_lr), z_proj_hr
+    return torch.cat([low, high], dim=-1)
+
+
+def _mean_token_l2(value: torch.Tensor) -> float:
+    return float(torch.linalg.vector_norm(value.float(), dim=-1).mean().item())
+
+
+def summarize_projected_features(
+    z_proj_lr: torch.Tensor,
+    z_proj_hr: torch.Tensor,
+    z_proj: torch.Tensor,
+    mode: str,
+) -> dict[str, Any]:
+    mode = validate_proj_feature_mode(mode)
+    channels = z_proj_lr.shape[-1]
+    masked_lr = z_proj[..., :channels]
+    masked_hr = z_proj[..., channels:]
+    lr_norm = _mean_token_l2(z_proj_lr)
+    hr_norm = _mean_token_l2(z_proj_hr)
+    cosine = F.cosine_similarity(
+        z_proj_lr.float(),
+        z_proj_hr.float(),
+        dim=-1,
+        eps=1e-8,
+    ).mean()
+    excluded = masked_hr if mode == "low_only" else masked_lr
+    return {
+        "mode": mode,
+        "tokens": int(z_proj.shape[-2]),
+        "channels": int(z_proj.shape[-1]),
+        "lr_mean_l2": lr_norm,
+        "hr_mean_l2": hr_norm,
+        "lr_to_hr_norm_ratio": None if hr_norm == 0.0 else lr_norm / hr_norm,
+        "lr_hr_mean_cosine": float(cosine.item()),
+        "masked_lr_mean_l2": _mean_token_l2(masked_lr),
+        "masked_hr_mean_l2": _mean_token_l2(masked_hr),
+        "excluded_half_exact_zero": (
+            None
+            if mode == "concat"
+            else bool(torch.count_nonzero(excluded).item() == 0)
+        ),
+    }
+
+
 # =============================================================================
 # Projection Utilities
 # =============================================================================
