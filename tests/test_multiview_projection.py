@@ -281,18 +281,26 @@ class MultiViewProjectionTests(unittest.TestCase):
         pipeline.sparse_structure_sampler = DummySampler()
         pipeline.sparse_structure_sampler_params = {}
 
+        coords = pipeline.sample_sparse_structure(
+            cond={},
+            resolution=2,
+        )
         result = pipeline.sample_sparse_structure(
             cond={},
             resolution=2,
             return_details=True,
         )
 
+        self.assertEqual(coords.dtype, torch.int32)
+        self.assertTrue(coords.is_contiguous())
         self.assertEqual(result.resolution, 2)
         self.assertEqual(result.scores.shape, (1, 2, 2, 2))
         self.assertEqual(result.occupancy.dtype, torch.bool)
         self.assertTrue(result.occupancy[0, 0, 0, 0])
         self.assertTrue(result.occupancy[0, 1, 1, 1])
         self.assertEqual(int(result.occupancy.sum()), 2)
+        self.assertEqual(result.coords.dtype, torch.int32)
+        self.assertTrue(result.coords.is_contiguous())
         self.assertTrue(
             torch.equal(
                 result.coords,

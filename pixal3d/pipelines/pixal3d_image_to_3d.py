@@ -598,7 +598,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             decoded_scores = torch.nn.functional.max_pool3d(decoded_scores, ratio, ratio, 0)
         scores = decoded_scores[:, 0]
         occupancy = scores > 0
-        coords = torch.argwhere(occupancy).int()
+        coords = torch.argwhere(occupancy).int().contiguous()
 
         if return_details:
             return SparseStructureSample(
