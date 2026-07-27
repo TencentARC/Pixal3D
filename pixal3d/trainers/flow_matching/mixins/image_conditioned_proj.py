@@ -458,7 +458,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
     1. Global features (CLS token + register tokens) in embed_dim
     2. View-aligned projected features (3D grid projected to 2D and sampled)
        - Without NAF: [B, R³, embed_dim]
-       - With NAF:    [B, R³, embed_dim * 2]  (concat of lr and hr features)
+       - With NAF:    [B, R³, embed_dim * 2], with a fixed-width feature mode:
+         - ``concat`` preserves both low- and high-resolution branches.
+         - ``low_only`` zeroes the high-resolution half.
+         - ``high_only`` zeroes the low-resolution half.
+         All modes preserve the 2048-channel NAF interface (for embed_dim=1024).
     
     NOTE: proj_linear has been moved to per-block ProjectAttention / SparseProjectAttention.
     This module now outputs raw DINOv3 features for proj (optionally concatenated with NAF-upsampled features).
@@ -469,6 +473,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         grid_resolution: Resolution of the 3D projection grid (default: 16)
         use_naf_upsample: Whether to use NAF to upsample features (default: False)
         naf_target_size: Target spatial size for NAF upsampling (default: [128, 128])
+        proj_feature_mode: NAF branch combination mode: ``concat``, ``low_only``,
+            or ``high_only`` (default: ``concat``)
     """
     def __init__(
         self, 
@@ -477,12 +483,20 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         grid_resolution: int = 16,
         use_naf_upsample: bool = False,
         naf_target_size: Optional[List[int]] = None,
+        proj_feature_mode: str = "concat",
     ):
         super().__init__()
         self.model_name = model_name
         self.image_size = image_size
         self.grid_resolution = grid_resolution
         self.use_naf_upsample = use_naf_upsample
+        self.proj_feature_mode = validate_proj_feature_mode(proj_feature_mode)
+        if not use_naf_upsample and self.proj_feature_mode != "concat":
+            raise ValueError(
+                f"proj_feature_mode={self.proj_feature_mode!r} requires "
+                "use_naf_upsample=True."
+            )
+        self.last_proj_feature_stats: Optional[dict[str, Any]] = None
         if naf_target_size is None:
             self.naf_target_size = (128, 128)
         elif isinstance(naf_target_size, int):
@@ -520,6 +534,14 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         self.proj_channels = self.embed_dim * 2 if use_naf_upsample else self.embed_dim
         
         # NOTE: proj_linear removed — now lives in each denoiser block's ProjectAttention
+
+    def set_proj_feature_mode(self, mode: str) -> None:
+        mode = validate_proj_feature_mode(mode)
+        if not self.use_naf_upsample and mode != "concat":
+            raise ValueError(
+                f"proj_feature_mode={mode!r} requires use_naf_upsample=True."
+            )
+        self.proj_feature_mode = mode
     
     def _load_naf(self):
         """Lazy-load pretrained NAF model."""
@@ -662,10 +684,20 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                     BHWC=False  # hr_features is [B, C, H', W']
                 )  # [B, grid_res³, D]
                 
-                # Concatenate lr and hr: [B, grid_res³, D*2]
-                z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)
+                z_proj = combine_projected_features(
+                    z_proj_lr,
+                    z_proj_hr,
+                    self.proj_feature_mode,
+                )
+                self.last_proj_feature_stats = summarize_projected_features(
+                    z_proj_lr,
+                    z_proj_hr,
+                    z_proj,
+                    self.proj_feature_mode,
+                )
             else:
                 z_proj = z_proj_lr  # [B, grid_res³, D]
+                self.last_proj_feature_stats = None
                 
             # Combine global tokens
             z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
