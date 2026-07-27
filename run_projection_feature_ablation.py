@@ -160,9 +160,12 @@ def prepare_input(
         input_image = input_image.convert("RGB")
         if pipeline.low_vram:
             pipeline.rembg_model.to(pipeline.device)
-        foreground = pipeline.rembg_model(input_image)
-        if pipeline.low_vram:
-            pipeline.rembg_model.cpu()
+            try:
+                foreground = pipeline.rembg_model(input_image)
+            finally:
+                pipeline.rembg_model.cpu()
+        else:
+            foreground = pipeline.rembg_model(input_image)
 
     foreground_array = np.asarray(foreground)
     alpha = foreground_array[:, :, 3]
@@ -614,35 +617,34 @@ def _resume_fingerprint(metadata: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _stored_run_metadata(
+def _require_completed_siblings_resume_safe(
     manifest_path: Path,
-    run_id: str,
-) -> dict[str, Any] | None:
-    if not manifest_path.exists():
-        return None
-    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    run = manifest_data.get("runs", {}).get(run_id)
-    if run is None:
-        return None
-    return dict(run.get("metadata", {}))
-
-
-def _require_matching_resume_fingerprint(
-    manifest_path: Path,
-    run_id: str,
+    phase: str,
+    image_path: Path,
     current_metadata: dict[str, Any],
 ) -> None:
-    stored_metadata = _stored_run_metadata(manifest_path, run_id)
-    if stored_metadata is None:
-        raise RuntimeError(f"Missing manifest metadata for completed run {run_id}")
-    stored_fingerprint = stored_metadata.get("resume_fingerprint")
-    if stored_fingerprint is None:
-        stored_fingerprint = _resume_fingerprint(stored_metadata)
-    if stored_fingerprint != current_metadata["resume_fingerprint"]:
-        raise RuntimeError(
-            "Refusing to resume completed run with a metadata fingerprint "
-            f"mismatch: {run_id}"
-        )
+    if not manifest_path.exists():
+        return
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for run_id, run in manifest_data.get("runs", {}).items():
+        if run.get("status") != "completed":
+            continue
+        stored_metadata = dict(run.get("metadata", {}))
+        stored_image = stored_metadata.get("image")
+        if (
+            stored_metadata.get("phase") != phase
+            or stored_image is None
+            or Path(stored_image).stem != image_path.stem
+        ):
+            continue
+        stored_fingerprint = stored_metadata.get("resume_fingerprint")
+        if stored_fingerprint is None:
+            stored_fingerprint = _resume_fingerprint(stored_metadata)
+        if stored_fingerprint != current_metadata["resume_fingerprint"]:
+            raise RuntimeError(
+                "Refusing to resume an image namespace with a metadata "
+                f"fingerprint mismatch: {run_id}"
+            )
 
 
 def run_matrix(
@@ -699,27 +701,22 @@ def run_matrix(
                 stopped = True
                 break
             continue
-        for seed in args.seeds:
-            for mode in args.modes:
-                paths = run_paths(output_root, args.phase, image_path, seed, mode)
-                run_id = _run_id(args.phase, image_path, seed, mode)
-                required = _required_artifacts(paths, args.turntable_frames)
-                if manifest.is_complete(run_id, required):
-                    metadata = _run_metadata(
-                        args,
-                        image_path,
-                        prepared,
-                        seed,
-                        mode,
-                        pipeline_settings,
-                        git_commit,
-                        dirty_worktree,
-                    )
-                    _require_matching_resume_fingerprint(
-                        manifest_path,
-                        run_id,
-                        metadata,
-                    )
+        namespace_metadata = _run_metadata(
+            args,
+            image_path,
+            prepared,
+            args.seeds[0],
+            args.modes[0],
+            pipeline_settings,
+            git_commit,
+            dirty_worktree,
+        )
+        _require_completed_siblings_resume_safe(
+            manifest_path,
+            args.phase,
+            image_path,
+            namespace_metadata,
+        )
         reference_path = _save_prepared_input(prepared, output_root, args.phase)
         for seed in args.seeds:
             for mode in args.modes:

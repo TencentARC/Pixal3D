@@ -198,6 +198,61 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             )
             self.assertFalse(camera_inputs[0][0].exists())
 
+    def test_low_vram_rembg_failure_returns_model_to_cpu(self):
+        class FailingRembg:
+            def __init__(self):
+                self.events = []
+
+            def to(self, device):
+                self.events.append(("to", device))
+                return self
+
+            def __call__(self, image):
+                self.events.append(("call", image.mode))
+                raise RuntimeError("rembg failed")
+
+            def cpu(self):
+                self.events.append(("cpu", None))
+                return self
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "opaque.png"
+            Image.new("RGB", (8, 8), "white").save(image_path)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "pilot",
+                    "--images",
+                    str(image_path),
+                    "--output_root",
+                    str(root / "outputs"),
+                ]
+            )
+            rembg_model = FailingRembg()
+            pipeline = SimpleNamespace(
+                low_vram=True,
+                device="cuda:3",
+                rembg_model=rembg_model,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "rembg failed"):
+                runner.prepare_input(
+                    pipeline,
+                    object(),
+                    image_path,
+                    args,
+                )
+
+            self.assertEqual(
+                rembg_model.events,
+                [
+                    ("to", "cuda:3"),
+                    ("call", "RGB"),
+                    ("cpu", None),
+                ],
+            )
+
     def test_generate_condition_exports_fixed_camera_artifacts_and_metrics(self):
         class Stage:
             def __init__(self):
@@ -744,6 +799,154 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             ):
                 runner.run_matrix(
                     changed_args,
+                    pipeline=pipeline,
+                    moge_model=object(),
+                )
+            generate.assert_not_called()
+
+    def test_new_seed_rejects_changed_source_from_completed_sibling_runs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            _write_transparent_source(image_path, (180, 30, 50))
+            common_argv = [
+                "--phase",
+                "pilot",
+                "--images",
+                str(image_path),
+                "--modes",
+                *MODES,
+                "--output_root",
+                str(root / "outputs"),
+                "--device",
+                "cpu",
+            ]
+            original_args = runner.parse_args(
+                [*common_argv, "--seeds", "42"]
+            )
+            pipeline = _TransparentPipeline()
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(
+                    runner,
+                    "generate_condition",
+                    side_effect=_write_successful_artifacts,
+                ),
+                patch.object(runner, "write_experiment_report"),
+            ):
+                self.assertEqual(
+                    runner.run_matrix(
+                        original_args,
+                        pipeline=pipeline,
+                        moge_model=object(),
+                    ),
+                    0,
+                )
+
+            input_path = (
+                Path(original_args.output_root)
+                / "pilot"
+                / image_path.stem
+                / "input_preprocessed.png"
+            )
+            original_input = input_path.read_bytes()
+            _write_transparent_source(image_path, (30, 170, 70))
+            new_seed_args = runner.parse_args(
+                [*common_argv, "--seeds", "43"]
+            )
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(runner, "generate_condition") as generate,
+                patch.object(runner, "write_experiment_report"),
+                self.assertRaisesRegex(RuntimeError, "fingerprint"),
+            ):
+                runner.run_matrix(
+                    new_seed_args,
+                    pipeline=pipeline,
+                    moge_model=object(),
+                )
+
+            generate.assert_not_called()
+            self.assertEqual(input_path.read_bytes(), original_input)
+
+    def test_failed_mode_retry_rejects_config_changed_from_completed_siblings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            _write_transparent_source(image_path, (90, 110, 130))
+            common_argv = [
+                "--phase",
+                "pilot",
+                "--images",
+                str(image_path),
+                "--seeds",
+                "42",
+                "--output_root",
+                str(root / "outputs"),
+                "--device",
+                "cpu",
+            ]
+            original_args = runner.parse_args(
+                [*common_argv, "--modes", *MODES]
+            )
+            pipeline = _TransparentPipeline()
+
+            def fail_low_only(*call_args):
+                if call_args[3] == "low_only":
+                    raise RuntimeError("deliberate low-only failure")
+                return _write_successful_artifacts(*call_args)
+
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(
+                    runner,
+                    "generate_condition",
+                    side_effect=fail_low_only,
+                ),
+                patch.object(runner, "write_experiment_report"),
+            ):
+                self.assertEqual(
+                    runner.run_matrix(
+                        original_args,
+                        pipeline=pipeline,
+                        moge_model=object(),
+                    ),
+                    1,
+                )
+
+            retry_args = runner.parse_args(
+                [
+                    *common_argv,
+                    "--modes",
+                    "low_only",
+                    "--decimation_target",
+                    "100000",
+                ]
+            )
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(runner, "generate_condition") as generate,
+                patch.object(runner, "write_experiment_report"),
+                self.assertRaisesRegex(RuntimeError, "fingerprint"),
+            ):
+                runner.run_matrix(
+                    retry_args,
                     pipeline=pipeline,
                     moge_model=object(),
                 )
