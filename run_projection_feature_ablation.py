@@ -282,6 +282,9 @@ def generate_condition(
     _atomic_write_json(paths.feature_stats, feature_stats)
     geometry_metrics = mesh_statistics(mesh.vertices, mesh.faces)
 
+    if args.low_vram:
+        gc.collect()
+        torch.cuda.empty_cache()
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,

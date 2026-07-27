@@ -320,7 +320,7 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 ],
             )
 
-    def test_generate_condition_exports_fixed_camera_artifacts_and_metrics(self):
+    def test_low_vram_generate_condition_releases_cuda_cache_before_export(self):
         class Stage:
             def __init__(self):
                 self.modes = []
@@ -356,6 +356,7 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                     str(root / "outputs"),
                     "--render_resolution",
                     "32",
+                    "--low_vram",
                 ]
             )
             stages = [Stage(), Stage(), Stage()]
@@ -407,11 +408,27 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 ],
             }
             fake_glb = FakeGlb()
+            memory_events = []
+
+            def to_glb_after_cache_release(**kwargs):
+                memory_events.append("to_glb")
+                return fake_glb
+
             with (
                 patch.object(runner.torch, "manual_seed") as manual_seed,
                 patch.object(
                     runner.torch.cuda, "manual_seed_all"
                 ) as cuda_manual_seed,
+                patch.object(
+                    runner.gc,
+                    "collect",
+                    side_effect=lambda: memory_events.append("gc"),
+                ),
+                patch.object(
+                    runner.torch.cuda,
+                    "empty_cache",
+                    side_effect=lambda: memory_events.append("empty_cache"),
+                ),
                 patch.object(
                     runner,
                     "_load_forest_envmap",
@@ -430,7 +447,7 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 patch.object(
                     runner.o_voxel.postprocess,
                     "to_glb",
-                    return_value=fake_glb,
+                    side_effect=to_glb_after_cache_release,
                 ) as to_glb,
             ):
                 result = runner.generate_condition(
@@ -443,6 +460,10 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 )
 
             self.assertEqual([stage.modes for stage in stages], [["low_only"]] * 3)
+            self.assertEqual(
+                memory_events[:3],
+                ["gc", "empty_cache", "to_glb"],
+            )
             manual_seed.assert_called_once_with(42)
             cuda_manual_seed.assert_called_once_with(42)
             run_kwargs = pipeline.run.call_args.kwargs
@@ -652,6 +673,11 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 common_patches[0],
                 common_patches[1],
                 patch.object(runner, "generate_condition", side_effect=fail_middle),
+                patch.object(runner.gc, "collect") as failed_collect,
+                patch.object(
+                    runner.torch.cuda,
+                    "empty_cache",
+                ) as failed_empty_cache,
             ):
                 first_exit = runner.run_matrix(
                     args, pipeline=object(), moge_model=object()
@@ -676,6 +702,8 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             }
             self.assertEqual(first_exit, 1)
             self.assertEqual(first_modes, list(MODES))
+            failed_collect.assert_called_once()
+            failed_empty_cache.assert_called_once()
             self.assertEqual(
                 statuses,
                 {
