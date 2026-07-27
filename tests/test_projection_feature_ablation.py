@@ -444,3 +444,44 @@ class ProjectionFeatureAblationTests(unittest.TestCase):
             self.assertIn("b", comparison["error"])
             self.assertIn("43", comparison["error"])
             self.assertNotIn("bootstrap_95_ci", comparison)
+
+    def test_experiment_report_does_not_drop_pairs_with_none_metric(self):
+        rows = [
+            {
+                "image": "a",
+                "seed": 42,
+                "mode": "concat",
+                "status": "completed",
+                "foreground_rgb_mae": 0.2,
+            },
+            {
+                "image": "a",
+                "seed": 42,
+                "mode": "low_only",
+                "status": "completed",
+                "foreground_rgb_mae": 0.1,
+            },
+            {
+                "image": "b",
+                "seed": 43,
+                "mode": "concat",
+                "status": "completed",
+                "foreground_rgb_mae": None,
+            },
+            {
+                "image": "b",
+                "seed": 43,
+                "mode": "low_only",
+                "status": "completed",
+                "foreground_rgb_mae": None,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            write_experiment_report(rows, output_dir)
+            summary = json.loads((output_dir / "summary.json").read_text())
+            comparison = summary["paired"]["foreground_rgb_mae"]["low_only"]
+            self.assertIn("b", comparison["error"])
+            self.assertIn("43", comparison["error"])
+            self.assertIn("foreground_rgb_mae", comparison["error"])
+            self.assertNotIn("bootstrap_95_ci", comparison)

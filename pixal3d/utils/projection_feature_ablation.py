@@ -498,7 +498,6 @@ def write_experiment_report(
                 row
                 for row in completed
                 if row.get("mode") in ("concat", candidate_mode)
-                and row.get(metric) is not None
             ]
             if relevant_rows:
                 try:
