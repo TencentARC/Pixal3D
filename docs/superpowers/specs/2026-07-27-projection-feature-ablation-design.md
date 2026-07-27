@@ -139,19 +139,16 @@ other results.
 
 ### Pilot
 
-- Six representative images.
+- Six fixed representative images:
+  - `assets/images/0_img.png` — dense texture and asymmetric geometry,
+  - `assets/images/3_img.webp` — thin leaves and hanging structures,
+  - `assets/images/9_img.png` — articulated mechanical parts,
+  - `assets/images/10_img.webp` — reflective and metallic materials,
+  - `assets/images/11_img.png` — separated stems, leaves, and flowers, and
+  - `assets/images/s_15_img.png` — photographic multi-object composition.
 - One seed: `42`.
 - Three modes.
 - Total: 18 generations.
-
-The pilot set should cover:
-
-- a smooth object with little texture,
-- a highly textured object,
-- thin structures,
-- articulated or separated parts,
-- reflective or metallic appearance, and
-- an asymmetric object whose back-side hallucination is visually apparent.
 
 Pilot completion is required before the main run. Its purpose is to verify
 conditioning masks, output generation, camera-aligned rendering, metrics, and
@@ -159,10 +156,10 @@ contact-sheet readability.
 
 ### Main
 
-- All 20 images currently under `assets/images`.
+- All 19 image files currently under `assets/images`.
 - Seeds: `42`, `43`, and `44`.
 - Modes: `concat`, `low_only`, and `high_only`.
-- Total: 180 generations.
+- Total: 171 generations.
 
 Every condition uses identical:
 
@@ -212,6 +209,11 @@ quantitative metrics are image-space consistency metrics:
 - LPIPS at the conditioning view,
 - SSIM at the conditioning view, and
 - foreground RGB mean absolute error as a descriptive metric.
+
+The reference for these metrics is the exact preprocessed RGB image and
+foreground mask used by the conditioning pipeline, not the unprocessed source
+file. This keeps background removal, object framing, and compositing identical
+across all three modes.
 
 Render and reference images are composited onto the same background and cropped
 to their mask union before appearance metrics are computed. Silhouette metrics
@@ -313,7 +315,7 @@ Run one pilot image with seed 42 through all three modes and verify:
 
 ### Pilot gate
 
-Review all six pilot contact sheets before launching the 180-run main matrix.
+Review all six pilot contact sheets before launching the 171-run main matrix.
 The main run starts only if:
 
 - no condition systematically fails,
@@ -329,7 +331,7 @@ The experiment is complete when:
 1. existing inference remains backward-compatible,
 2. the three conditioning modes are verified at the tensor level,
 3. all pilot runs and artifacts pass the pilot gate,
-4. all 180 main runs have resumable manifest entries and required outputs,
+4. all 171 main runs have resumable manifest entries and required outputs,
 5. paired quantitative summaries and visual contact sheets are generated, and
 6. the report clearly explains which branch improves or degrades input-view
    fidelity, visual detail, structural stability, and seed consistency without
