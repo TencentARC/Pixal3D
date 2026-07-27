@@ -19,6 +19,26 @@ from pixal3d.utils.projection_feature_ablation import PILOT_IMAGES
 MODES = ("concat", "low_only", "high_only")
 
 
+class _TransparentPipeline:
+    low_vram = False
+    preprocess_image = Pixal3DImageTo3DPipeline.preprocess_image
+
+
+def _write_transparent_source(path, color):
+    rgba = np.zeros((20, 20, 4), dtype=np.uint8)
+    rgba[4:17, 4:17, :3] = color
+    rgba[4:17, 4:17, 3] = 255
+    Image.fromarray(rgba, "RGBA").save(path)
+
+
+def _camera_params(*args, **kwargs):
+    return {
+        "camera_angle_x": 0.8,
+        "distance": 2.0,
+        "mesh_scale": 1.0,
+    }
+
+
 def _write_successful_artifacts(
     pipeline,
     prepared,
@@ -168,15 +188,15 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 prepared.image_sha256,
                 hashlib.sha256(image_path.read_bytes()).hexdigest(),
             )
-            self.assertEqual(
-                camera_inputs[0][0],
-                expected_dir / "input_preprocessed.png",
+            self.assertEqual(camera_inputs[0][0].parent, expected_dir)
+            self.assertTrue(
+                camera_inputs[0][0].name.startswith(".input_preprocessed.")
             )
             np.testing.assert_array_equal(
                 camera_inputs[0][1],
                 np.asarray(expected_rgb),
             )
-            self.assertTrue((expected_dir / "input_mask.png").exists())
+            self.assertFalse(camera_inputs[0][0].exists())
 
     def test_generate_condition_exports_fixed_camera_artifacts_and_metrics(self):
         class Stage:
@@ -602,6 +622,277 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 )
             self.assertEqual(third_exit, 0)
             self.assertEqual(incomplete_modes, ["high_only"])
+
+    def test_resume_rejects_changed_source_without_replacing_shared_input(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            _write_transparent_source(image_path, (200, 20, 40))
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "pilot",
+                    "--images",
+                    str(image_path),
+                    "--seeds",
+                    "42",
+                    "--modes",
+                    *MODES,
+                    "--output_root",
+                    str(root / "outputs"),
+                    "--device",
+                    "cpu",
+                ]
+            )
+            pipeline = _TransparentPipeline()
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(
+                    runner,
+                    "generate_condition",
+                    side_effect=_write_successful_artifacts,
+                ),
+                patch.object(runner, "write_experiment_report"),
+            ):
+                self.assertEqual(
+                    runner.run_matrix(args, pipeline=pipeline, moge_model=object()),
+                    0,
+                )
+
+            input_path = (
+                Path(args.output_root)
+                / "pilot"
+                / image_path.stem
+                / "input_preprocessed.png"
+            )
+            original_input = input_path.read_bytes()
+            _write_transparent_source(image_path, (20, 180, 60))
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(runner, "generate_condition") as generate,
+                patch.object(runner, "write_experiment_report"),
+                self.assertRaisesRegex(RuntimeError, "fingerprint"),
+            ):
+                runner.run_matrix(args, pipeline=pipeline, moge_model=object())
+
+            generate.assert_not_called()
+            self.assertEqual(input_path.read_bytes(), original_input)
+
+    def test_resume_rejects_changed_generation_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            _write_transparent_source(image_path, (100, 120, 140))
+            base_argv = [
+                "--phase",
+                "pilot",
+                "--images",
+                str(image_path),
+                "--seeds",
+                "42",
+                "--modes",
+                *MODES,
+                "--output_root",
+                str(root / "outputs"),
+                "--device",
+                "cpu",
+            ]
+            original_args = runner.parse_args(base_argv)
+            pipeline = _TransparentPipeline()
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(
+                    runner,
+                    "generate_condition",
+                    side_effect=_write_successful_artifacts,
+                ),
+                patch.object(runner, "write_experiment_report"),
+            ):
+                self.assertEqual(
+                    runner.run_matrix(
+                        original_args,
+                        pipeline=pipeline,
+                        moge_model=object(),
+                    ),
+                    0,
+                )
+
+            changed_args = runner.parse_args(
+                [*base_argv, "--decimation_target", "100000"]
+            )
+            with (
+                patch.object(
+                    runner,
+                    "get_camera_params_wild_moge",
+                    side_effect=_camera_params,
+                ),
+                patch.object(runner, "generate_condition") as generate,
+                patch.object(runner, "write_experiment_report"),
+                self.assertRaisesRegex(RuntimeError, "fingerprint"),
+            ):
+                runner.run_matrix(
+                    changed_args,
+                    pipeline=pipeline,
+                    moge_model=object(),
+                )
+            generate.assert_not_called()
+
+    def test_preparation_failure_marks_image_runs_and_continues_to_next_image(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bad_image = root / "bad.png"
+            good_image = root / "good.png"
+            bad_image.write_bytes(b"corrupt image")
+            Image.new("RGB", (8, 8), "white").save(good_image)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "pilot",
+                    "--images",
+                    str(bad_image),
+                    str(good_image),
+                    "--seeds",
+                    "42",
+                    "--modes",
+                    *MODES,
+                    "--output_root",
+                    str(root / "outputs"),
+                ]
+            )
+            prepared = SimpleNamespace(
+                image_path=good_image,
+                image_sha256="good-hash",
+                rgb=Image.new("RGB", (8, 8), "black"),
+                mask=Image.new("L", (8, 8), 255),
+                camera_params={
+                    "camera_angle_x": 0.8,
+                    "distance": 2.0,
+                    "mesh_scale": 1.0,
+                },
+            )
+            prepared_images = []
+            generated = []
+
+            def prepare(pipeline, moge_model, image_path, call_args):
+                prepared_images.append(image_path)
+                if image_path == bad_image:
+                    raise ValueError("cannot decode source image")
+                return prepared
+
+            def generate(*call_args):
+                generated.append((call_args[1].image_path, call_args[3]))
+                return _write_successful_artifacts(*call_args)
+
+            with (
+                patch.object(runner, "prepare_input", side_effect=prepare),
+                patch.object(runner, "generate_condition", side_effect=generate),
+                patch.object(runner.gc, "collect") as collect,
+                patch.object(runner.torch.cuda, "empty_cache") as empty_cache,
+                patch.object(runner, "write_experiment_report") as report,
+            ):
+                exit_code = runner.run_matrix(
+                    args,
+                    pipeline=object(),
+                    moge_model=object(),
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(prepared_images, [bad_image, good_image])
+            self.assertEqual(
+                generated,
+                [(good_image, mode) for mode in MODES],
+            )
+            collect.assert_called_once()
+            empty_cache.assert_called_once()
+            manifest = json.loads(
+                (Path(args.output_root) / "manifest.json").read_text()
+            )
+            by_image_and_mode = {
+                (run["metadata"]["image"], run["metadata"]["mode"]): run
+                for run in manifest["runs"].values()
+            }
+            self.assertEqual(len(by_image_and_mode), 6)
+            for mode in MODES:
+                failed = by_image_and_mode[(str(bad_image), mode)]
+                self.assertEqual(failed["status"], "failed")
+                self.assertIn("cannot decode source image", failed["error"])
+                self.assertEqual(
+                    by_image_and_mode[(str(good_image), mode)]["status"],
+                    "completed",
+                )
+            report.assert_called_once()
+            self.assertEqual(len(report.call_args.args[0]), 6)
+
+    def test_preparation_failure_fail_fast_reports_failed_image_and_stops(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bad_image = root / "bad.png"
+            skipped_image = root / "skipped.png"
+            bad_image.write_bytes(b"corrupt image")
+            Image.new("RGB", (8, 8), "white").save(skipped_image)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "pilot",
+                    "--images",
+                    str(bad_image),
+                    str(skipped_image),
+                    "--seeds",
+                    "42",
+                    "--modes",
+                    *MODES,
+                    "--output_root",
+                    str(root / "outputs"),
+                    "--fail_fast",
+                ]
+            )
+            with (
+                patch.object(
+                    runner,
+                    "prepare_input",
+                    side_effect=ValueError("cannot decode source image"),
+                ) as prepare,
+                patch.object(runner, "generate_condition") as generate,
+                patch.object(runner.gc, "collect") as collect,
+                patch.object(runner.torch.cuda, "empty_cache") as empty_cache,
+                patch.object(runner, "write_experiment_report") as report,
+            ):
+                exit_code = runner.run_matrix(
+                    args,
+                    pipeline=object(),
+                    moge_model=object(),
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(prepare.call_count, 1)
+            generate.assert_not_called()
+            collect.assert_called_once()
+            empty_cache.assert_called_once()
+            manifest = json.loads(
+                (Path(args.output_root) / "manifest.json").read_text()
+            )
+            self.assertEqual(len(manifest["runs"]), 3)
+            self.assertTrue(
+                all(
+                    run["status"] == "failed"
+                    and run["metadata"]["image"] == str(bad_image)
+                    for run in manifest["runs"].values()
+                )
+            )
+            report.assert_called_once()
+            self.assertEqual(len(report.call_args.args[0]), 3)
 
 
 if __name__ == "__main__":

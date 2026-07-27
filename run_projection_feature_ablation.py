@@ -198,18 +198,25 @@ def prepare_input(
 
     image_dir = Path(args.output_root) / args.phase / image_path.stem
     image_dir.mkdir(parents=True, exist_ok=True)
-    preprocessed_path = image_dir / "input_preprocessed.png"
-    mask_path = image_dir / "input_mask.png"
-    preprocessed.save(preprocessed_path)
-    mask.save(mask_path)
-    camera_params = get_camera_params_wild_moge(
-        preprocessed_path,
-        moge_model,
-        device=args.device,
-        mesh_scale=1.0,
-        extend_pixel=0,
-        image_resolution=args.render_resolution,
+    descriptor, candidate_name = tempfile.mkstemp(
+        prefix=".input_preprocessed.",
+        suffix=".png",
+        dir=image_dir,
     )
+    os.close(descriptor)
+    candidate_path = Path(candidate_name)
+    try:
+        preprocessed.save(candidate_path)
+        camera_params = get_camera_params_wild_moge(
+            candidate_path,
+            moge_model,
+            device=args.device,
+            mesh_scale=1.0,
+            extend_pixel=0,
+            image_resolution=args.render_resolution,
+        )
+    finally:
+        candidate_path.unlink(missing_ok=True)
     return PreparedInput(
         image_path=image_path,
         image_sha256=image_sha256,
@@ -476,11 +483,24 @@ def _save_prepared_input(
     image_dir.mkdir(parents=True, exist_ok=True)
     rgb_path = image_dir / "input_preprocessed.png"
     mask_path = image_dir / "input_mask.png"
-    if not rgb_path.exists():
-        prepared.rgb.save(rgb_path)
-    if not mask_path.exists():
-        prepared.mask.save(mask_path)
+    _atomic_save_image(prepared.rgb, rgb_path)
+    _atomic_save_image(prepared.mask, mask_path)
     return rgb_path
+
+
+def _atomic_save_image(image: Image.Image, path: Path) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=path.suffix,
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        image.save(temporary_path)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _manifest_rows(
@@ -518,6 +538,113 @@ def _manifest_rows(
     return rows
 
 
+def _run_metadata(
+    args: argparse.Namespace,
+    image_path: Path,
+    prepared: PreparedInput,
+    seed: int,
+    mode: str,
+    pipeline_settings: dict[str, Any],
+    git_commit: str,
+    dirty_worktree: bool,
+) -> dict[str, Any]:
+    metadata = {
+        "phase": args.phase,
+        "image": str(image_path),
+        "image_sha256": prepared.image_sha256,
+        "seed": int(seed),
+        "mode": mode,
+        "model_path": args.model_path,
+        "pipeline_type": args.pipeline_type,
+        "max_num_tokens": args.max_num_tokens,
+        "pipeline_settings": pipeline_settings,
+        "camera": dict(prepared.camera_params),
+        "git_commit": git_commit,
+        "dirty_worktree": dirty_worktree,
+    }
+    metadata["resume_fingerprint"] = _resume_fingerprint(metadata)
+    return metadata
+
+
+def _preparation_failure_metadata(
+    args: argparse.Namespace,
+    image_path: Path,
+    image_sha256: str | None,
+    seed: int,
+    mode: str,
+    pipeline_settings: dict[str, Any],
+    git_commit: str,
+    dirty_worktree: bool,
+) -> dict[str, Any]:
+    metadata = {
+        "phase": args.phase,
+        "image": str(image_path),
+        "image_sha256": image_sha256,
+        "seed": int(seed),
+        "mode": mode,
+        "model_path": args.model_path,
+        "pipeline_type": args.pipeline_type,
+        "max_num_tokens": args.max_num_tokens,
+        "pipeline_settings": pipeline_settings,
+        "camera": None,
+        "git_commit": git_commit,
+        "dirty_worktree": dirty_worktree,
+    }
+    metadata["resume_fingerprint"] = _resume_fingerprint(metadata)
+    return metadata
+
+
+def _resume_fingerprint(metadata: dict[str, Any]) -> str:
+    deterministic = {
+        key: metadata.get(key)
+        for key in (
+            "image_sha256",
+            "camera",
+            "model_path",
+            "pipeline_settings",
+            "git_commit",
+            "dirty_worktree",
+        )
+    }
+    encoded = json.dumps(
+        deterministic,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stored_run_metadata(
+    manifest_path: Path,
+    run_id: str,
+) -> dict[str, Any] | None:
+    if not manifest_path.exists():
+        return None
+    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    run = manifest_data.get("runs", {}).get(run_id)
+    if run is None:
+        return None
+    return dict(run.get("metadata", {}))
+
+
+def _require_matching_resume_fingerprint(
+    manifest_path: Path,
+    run_id: str,
+    current_metadata: dict[str, Any],
+) -> None:
+    stored_metadata = _stored_run_metadata(manifest_path, run_id)
+    if stored_metadata is None:
+        raise RuntimeError(f"Missing manifest metadata for completed run {run_id}")
+    stored_fingerprint = stored_metadata.get("resume_fingerprint")
+    if stored_fingerprint is None:
+        stored_fingerprint = _resume_fingerprint(stored_metadata)
+    if stored_fingerprint != current_metadata["resume_fingerprint"]:
+        raise RuntimeError(
+            "Refusing to resume completed run with a metadata fingerprint "
+            f"mismatch: {run_id}"
+        )
+
+
 def run_matrix(
     args: argparse.Namespace,
     *,
@@ -543,7 +670,56 @@ def run_matrix(
 
     for image_name in args.images:
         image_path = Path(image_name)
-        prepared = prepare_input(pipeline, moge_model, image_path, args)
+        try:
+            prepared = prepare_input(pipeline, moge_model, image_path, args)
+        except Exception as error:
+            try:
+                image_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
+            except OSError:
+                image_sha256 = None
+            for seed in args.seeds:
+                for mode in args.modes:
+                    run_id = _run_id(args.phase, image_path, seed, mode)
+                    requested_run_ids.append(run_id)
+                    metadata = _preparation_failure_metadata(
+                        args,
+                        image_path,
+                        image_sha256,
+                        seed,
+                        mode,
+                        pipeline_settings,
+                        git_commit,
+                        dirty_worktree,
+                    )
+                    manifest.start(run_id, metadata)
+                    manifest.fail(run_id, error)
+            gc.collect()
+            torch.cuda.empty_cache()
+            if not args.continue_on_error:
+                stopped = True
+                break
+            continue
+        for seed in args.seeds:
+            for mode in args.modes:
+                paths = run_paths(output_root, args.phase, image_path, seed, mode)
+                run_id = _run_id(args.phase, image_path, seed, mode)
+                required = _required_artifacts(paths, args.turntable_frames)
+                if manifest.is_complete(run_id, required):
+                    metadata = _run_metadata(
+                        args,
+                        image_path,
+                        prepared,
+                        seed,
+                        mode,
+                        pipeline_settings,
+                        git_commit,
+                        dirty_worktree,
+                    )
+                    _require_matching_resume_fingerprint(
+                        manifest_path,
+                        run_id,
+                        metadata,
+                    )
         reference_path = _save_prepared_input(prepared, output_root, args.phase)
         for seed in args.seeds:
             for mode in args.modes:
@@ -553,20 +729,16 @@ def run_matrix(
                 required = _required_artifacts(paths, args.turntable_frames)
                 if manifest.is_complete(run_id, required):
                     continue
-                metadata = {
-                    "phase": args.phase,
-                    "image": str(image_path),
-                    "image_sha256": prepared.image_sha256,
-                    "seed": int(seed),
-                    "mode": mode,
-                    "model_path": args.model_path,
-                    "pipeline_type": args.pipeline_type,
-                    "max_num_tokens": args.max_num_tokens,
-                    "pipeline_settings": pipeline_settings,
-                    "camera": dict(prepared.camera_params),
-                    "git_commit": git_commit,
-                    "dirty_worktree": dirty_worktree,
-                }
+                metadata = _run_metadata(
+                    args,
+                    image_path,
+                    prepared,
+                    seed,
+                    mode,
+                    pipeline_settings,
+                    git_commit,
+                    dirty_worktree,
+                )
                 manifest.start(run_id, metadata)
                 try:
                     result = generate_condition(
@@ -697,6 +869,8 @@ def _pipeline_settings(
         if target_size is not None:
             naf_target_sizes[stage] = int(target_size)
     return {
+        "device": args.device,
+        "low_vram": args.low_vram,
         "pipeline_type": args.pipeline_type,
         "max_num_tokens": args.max_num_tokens,
         "render_resolution": args.render_resolution,
