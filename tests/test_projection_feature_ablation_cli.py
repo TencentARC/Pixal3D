@@ -97,6 +97,44 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             settings["naf_target_sizes"],
         )
 
+    def test_pipeline_settings_rejects_naf_target_size_with_wrong_length(self):
+        pipeline = SimpleNamespace(
+            image_cond_model_shape_512=SimpleNamespace(naf_target_size=[512]),
+        )
+        args = runner.parse_args(["--phase", "pilot"])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Malformed NAF target size for stage 'shape_512': \[512\]",
+        ):
+            runner._pipeline_settings(pipeline, args)
+
+    def test_pipeline_settings_rejects_non_sequence_naf_target_size(self):
+        pipeline = SimpleNamespace(
+            image_cond_model_shape_512=SimpleNamespace(naf_target_size="512"),
+        )
+        args = runner.parse_args(["--phase", "pilot"])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Malformed NAF target size for stage 'shape_512': '512'",
+        ):
+            runner._pipeline_settings(pipeline, args)
+
+    def test_pipeline_settings_rejects_non_convertible_naf_target_dimension(self):
+        pipeline = SimpleNamespace(
+            image_cond_model_shape_512=SimpleNamespace(
+                naf_target_size=[512, "wide"],
+            ),
+        )
+        args = runner.parse_args(["--phase", "pilot"])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Malformed NAF target size for stage 'shape_512': \[512, 'wide'\]",
+        ):
+            runner._pipeline_settings(pipeline, args)
+
     def test_pilot_and_main_defaults_resolve_fixed_matrices(self):
         pilot = runner.parse_args(["--phase", "pilot"])
         self.assertEqual(pilot.phase, "pilot")

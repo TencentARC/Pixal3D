@@ -864,7 +864,20 @@ def _pipeline_settings(
             None,
         )
         if target_size is not None:
-            naf_target_sizes[stage] = [int(dimension) for dimension in target_size]
+            if not isinstance(target_size, (tuple, list)) or len(target_size) != 2:
+                raise ValueError(
+                    f"Malformed NAF target size for stage {stage!r}: "
+                    f"{target_size!r}"
+                )
+            try:
+                naf_target_sizes[stage] = [
+                    int(dimension) for dimension in target_size
+                ]
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Malformed NAF target size for stage {stage!r}: "
+                    f"{target_size!r}"
+                ) from error
     return {
         "device": args.device,
         "low_vram": args.low_vram,
