@@ -64,6 +64,18 @@ def build_image_cond_model(config: dict):
     return model
 
 
+def image_cond_config(stage: str, proj_feature_mode: str = "concat") -> dict:
+    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
+        validate_proj_feature_mode,
+    )
+
+    mode = validate_proj_feature_mode(proj_feature_mode)
+    config = dict(IMAGE_COND_CONFIGS[stage])
+    if config.get("use_naf_upsample", False):
+        config["proj_feature_mode"] = mode
+    return config
+
+
 def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     from moge.model.v2 import MoGeModel
     moge_model = MoGeModel.from_pretrained(model_name).to(device)
@@ -71,7 +83,12 @@ def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     return moge_model
 
 
-def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
+def init_pipeline(
+    model_path=MODEL_PATH,
+    device="cuda",
+    low_vram=False,
+    proj_feature_mode: str = "concat",
+):
     device = torch.device(device)
     if device.type == "cuda":
         torch.cuda.set_device(device.index if device.index is not None else torch.cuda.current_device())
@@ -79,10 +96,10 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
     print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
-    pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
-    pipeline.image_cond_model_shape_512 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_512"])
-    pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
-    pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
+    pipeline.image_cond_model_ss = build_image_cond_model(image_cond_config("ss", proj_feature_mode))
+    pipeline.image_cond_model_shape_512 = build_image_cond_model(image_cond_config("shape_512", proj_feature_mode))
+    pipeline.image_cond_model_shape_1024 = build_image_cond_model(image_cond_config("shape_1024", proj_feature_mode))
+    pipeline.image_cond_model_tex_1024 = build_image_cond_model(image_cond_config("tex_1024", proj_feature_mode))
 
     pipeline.low_vram = bool(low_vram)
     pipeline.to(device)
@@ -169,9 +186,10 @@ def run_inference(
     image_resolution: int = 512,
     max_num_tokens: int = 49152,
     model_path: str = MODEL_PATH,
+    proj_feature_mode: str = "concat",
 ):
     # Load models
-    pipeline = init_pipeline(model_path)
+    pipeline = init_pipeline(model_path, proj_feature_mode=proj_feature_mode)
 
     print("[MoGe-2] Loading model for camera estimation...")
     moge_model = load_moge_model(device="cuda")
@@ -254,11 +272,21 @@ def run_inference(
 
 
 if __name__ == "__main__":
+    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
+        PROJ_FEATURE_MODES,
+    )
+
     parser = argparse.ArgumentParser(description="Pixal3D Inference: Image to GLB")
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output", type=str, default="./output.glb", help="Output GLB file path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path or HuggingFace repo")
+    parser.add_argument(
+        "--proj_feature_mode",
+        choices=PROJ_FEATURE_MODES,
+        default="concat",
+        help="Projection feature branch ablation for NAF-enabled shape/texture stages.",
+    )
 
     args = parser.parse_args()
 
@@ -267,4 +295,5 @@ if __name__ == "__main__":
         output_path=args.output,
         seed=args.seed,
         model_path=args.model_path,
+        proj_feature_mode=args.proj_feature_mode,
     )
