@@ -68,6 +68,35 @@ def _write_successful_artifacts(
 
 
 class ProjectionFeatureAblationCliTests(unittest.TestCase):
+    def test_pipeline_settings_preserve_tuple_naf_target_sizes_as_json_spatial_pairs(
+        self,
+    ):
+        class Stage:
+            def __init__(self, naf_target_size):
+                self.naf_target_size = naf_target_size
+
+        pipeline = SimpleNamespace(
+            image_cond_model_shape_512=Stage((512, 512)),
+            image_cond_model_shape_1024=Stage((512, 512)),
+            image_cond_model_tex_1024=Stage((1024, 1024)),
+        )
+        args = runner.parse_args(["--phase", "pilot"])
+
+        settings = runner._pipeline_settings(pipeline, args)
+
+        self.assertEqual(
+            settings["naf_target_sizes"],
+            {
+                "shape_512": [512, 512],
+                "shape_1024": [512, 512],
+                "tex_1024": [1024, 1024],
+            },
+        )
+        self.assertEqual(
+            json.loads(json.dumps(settings))["naf_target_sizes"],
+            settings["naf_target_sizes"],
+        )
+
     def test_pilot_and_main_defaults_resolve_fixed_matrices(self):
         pilot = runner.parse_args(["--phase", "pilot"])
         self.assertEqual(pilot.phase, "pilot")

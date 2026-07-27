@@ -864,7 +864,7 @@ def _pipeline_settings(
             None,
         )
         if target_size is not None:
-            naf_target_sizes[stage] = int(target_size)
+            naf_target_sizes[stage] = [int(dimension) for dimension in target_size]
     return {
         "device": args.device,
         "low_vram": args.low_vram,
