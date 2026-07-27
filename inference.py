@@ -9,7 +9,8 @@ from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["ATTN_BACKEND"] = "flash_attn_3"
+os.environ.setdefault("ATTN_BACKEND", "xformers")
+os.environ.setdefault("SPARSE_ATTN_BACKEND", os.environ["ATTN_BACKEND"])
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
@@ -70,7 +71,10 @@ def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     return moge_model
 
 
-def init_pipeline(model_path=MODEL_PATH, device="cuda"):
+def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device.index if device.index is not None else torch.cuda.current_device())
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
@@ -80,13 +84,14 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda"):
     pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
     pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
 
-    pipeline.low_vram = False
-    pipeline.cuda()
+    pipeline.low_vram = bool(low_vram)
+    pipeline.to(device)
 
-    pipeline.image_cond_model_ss.cuda()
-    pipeline.image_cond_model_shape_512.cuda()
-    pipeline.image_cond_model_shape_1024.cuda()
-    pipeline.image_cond_model_tex_1024.cuda()
+    if not pipeline.low_vram:
+        pipeline.image_cond_model_ss.to(device)
+        pipeline.image_cond_model_shape_512.to(device)
+        pipeline.image_cond_model_shape_1024.to(device)
+        pipeline.image_cond_model_tex_1024.to(device)
 
     print("[NAF] Pre-loading NAF upsampler model...")
     for attr in ['image_cond_model_ss', 'image_cond_model_shape_512', 'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:

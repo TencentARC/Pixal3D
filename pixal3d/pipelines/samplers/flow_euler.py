@@ -117,6 +117,21 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
+        control_latent = kwargs.pop("control", None)
+        space_control_tau = kwargs.pop("space_control_tau", 6)
+        start_step_idx = 0
+        if control_latent is not None:
+            start_step_idx = min(max(int(space_control_tau), 0), steps - 1)
+            t_0 = t_seq[start_step_idx]
+            control_latent = control_latent.to(device=noise.device, dtype=noise.dtype)
+            if control_latent.shape != noise.shape:
+                raise ValueError(
+                    f"SpaceControl latent shape {tuple(control_latent.shape)} "
+                    f"does not match sparse noise shape {tuple(noise.shape)}."
+                )
+            sample = t_0 * noise + (1.0 - t_0) * control_latent
+            t_pairs = t_pairs[start_step_idx:]
+
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             sample = out.pred_x_prev

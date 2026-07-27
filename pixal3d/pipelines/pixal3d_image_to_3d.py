@@ -1,13 +1,41 @@
 from typing import *
+from dataclasses import dataclass
+from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
 from PIL import Image
 from .base import Pipeline
 from . import samplers, rembg
+from .. import models as pixal3d_models
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
+from ..utils.spacecontrol import voxelize_sq_francis
+
+
+DEFAULT_SPACECONTROL_ENCODER_LOCAL = (
+    "/root/dev/TRELLIS.2/results/TRELLIS-image-large-spacecontrol/ckpts/ss_enc_conv3d_16l8_fp16"
+)
+DEFAULT_SPACECONTROL_ENCODER_HF = "microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16"
+
+
+@dataclass(frozen=True)
+class SparseStructureSample:
+    coords: torch.Tensor
+    occupancy: torch.Tensor
+    scores: torch.Tensor
+    resolution: int
+
+
+@dataclass(frozen=True)
+class MultiViewStageResult:
+    final_meshes: List[MeshWithVoxel]
+    sparse_coords: torch.Tensor
+    shape_meshes: Dict[int, List[Mesh]]
+    lr_resolution: int
+    hr_resolution: int
+    token_counts: Dict[str, int]
 
 
 class Pixal3DImageTo3DPipeline(Pipeline):
@@ -140,6 +168,47 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             super().to(device)
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
+
+    def _resolve_spacecontrol_encoder_path(self, encoder_path: Optional[str] = None) -> str:
+        if encoder_path is not None:
+            return encoder_path
+        local_base = Path(DEFAULT_SPACECONTROL_ENCODER_LOCAL)
+        if local_base.with_suffix(".json").exists() and local_base.with_suffix(".safetensors").exists():
+            return str(local_base)
+        return DEFAULT_SPACECONTROL_ENCODER_HF
+
+    def ensure_sparse_structure_encoder(self, encoder_path: Optional[str] = None) -> nn.Module:
+        if "sparse_structure_encoder" not in self.models:
+            resolved_path = self._resolve_spacecontrol_encoder_path(encoder_path)
+            print(f"[SpaceControl] Loading sparse_structure_encoder from {resolved_path}")
+            encoder = pixal3d_models.from_pretrained(resolved_path)
+            encoder.eval()
+            if not self.low_vram:
+                encoder.to(self.device)
+            self.models["sparse_structure_encoder"] = encoder
+        return self.models["sparse_structure_encoder"]
+
+    @torch.no_grad()
+    def encode_spatial_control(
+        self,
+        spatial_control_path: str,
+        encoder_path: Optional[str] = None,
+        transform_matrix: Optional[list[list[float]]] = None,
+    ) -> torch.Tensor:
+        encoder = self.ensure_sparse_structure_encoder(encoder_path)
+        spatial_control = voxelize_sq_francis(
+            spatial_control_path,
+            transform_matrix=transform_matrix,
+        ).to(device=self.device)
+
+        if self.low_vram:
+            encoder.to(self.device)
+        elif next(encoder.parameters()).device != self.device:
+            encoder.to(self.device)
+        spatial_control_latent = encoder(spatial_control)
+        if self.low_vram:
+            encoder.cpu()
+        return spatial_control_latent
 
     def preprocess_image(self, input: Image.Image, bg_color: tuple = (0, 0, 0)) -> Image.Image:
         """
@@ -294,6 +363,184 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             'neg_cond': {'global': torch.zeros_like(z_global), 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
         }
 
+    def _normalize_multiview_inputs(
+        self,
+        images: Sequence[Image.Image],
+        camera_params: Sequence[dict],
+    ) -> tuple[list[Image.Image], list[dict]]:
+        images = list(images)
+        camera_params = list(camera_params)
+        if len(images) == 0:
+            raise ValueError("At least one view is required for multi-view inference.")
+        if len(images) != len(camera_params):
+            raise ValueError(
+                f"Number of images ({len(images)}) must match number of camera parameter sets "
+                f"({len(camera_params)})."
+            )
+        for idx, params in enumerate(camera_params):
+            for key in ("camera_angle_x", "distance", "mesh_scale"):
+                if key not in params:
+                    raise KeyError(f"camera_params[{idx}] is missing required key '{key}'.")
+        return images, camera_params
+
+    def _validate_sparse_structure_override(
+        self,
+        coords: torch.Tensor,
+        resolution: int,
+    ) -> torch.Tensor:
+        if not isinstance(coords, torch.Tensor):
+            raise TypeError("sparse_structure_override must be a torch.Tensor.")
+        if coords.ndim != 2 or coords.shape[1] != 4 or coords.shape[0] == 0:
+            raise ValueError(
+                "sparse_structure_override must be non-empty with shape (N, 4)."
+            )
+        if coords.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            raise ValueError("sparse_structure_override must contain integer coordinates.")
+        normalized = coords.to(device=self.device, dtype=torch.int32)
+        if torch.any(normalized[:, 0] != 0):
+            raise ValueError("sparse_structure_override currently supports batch index 0 only.")
+        spatial = normalized[:, 1:]
+        if torch.any(spatial < 0) or torch.any(spatial >= resolution):
+            raise ValueError(
+                f"sparse_structure_override coordinates must be in [0, {resolution - 1}]."
+            )
+        if torch.unique(normalized, dim=0).shape[0] != normalized.shape[0]:
+            raise ValueError("sparse_structure_override contains duplicate coordinates.")
+        return normalized.contiguous()
+
+    def _camera_scalar_tensor(self, value: Union[float, torch.Tensor], device: torch.device) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            tensor = value.to(device=device, dtype=torch.float32).reshape(-1)
+        else:
+            tensor = torch.tensor([float(value)], device=device, dtype=torch.float32)
+        if tensor.numel() != 1:
+            raise ValueError(f"Expected a scalar camera parameter, got shape {tuple(tensor.shape)}.")
+        return tensor
+
+    def _camera_transform_tensor(
+        self,
+        value: Optional[Union[list[list[float]], torch.Tensor]],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value, dtype=torch.float32)
+        tensor = tensor.to(device=device, dtype=torch.float32)
+        if tensor.shape == (4, 4):
+            tensor = tensor.unsqueeze(0)
+        if tensor.shape != (1, 4, 4):
+            raise ValueError(f"Expected transform_matrix with shape (4, 4) or (1, 4, 4), got {tuple(tensor.shape)}.")
+        return tensor
+
+    @torch.no_grad()
+    def _extract_multiview_proj_features(
+        self,
+        image_cond_model: nn.Module,
+        images: Sequence[Image.Image],
+        camera_params: Sequence[dict],
+        grid_resolution_override: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        images, camera_params = self._normalize_multiview_inputs(images, camera_params)
+        device = self.device
+        if self.low_vram:
+            image_cond_model.to(device)
+
+        orig_grid_res = image_cond_model.grid_resolution
+        if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
+            image_cond_model.grid_resolution = grid_resolution_override
+            image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
+                grid_resolution=grid_resolution_override,
+                image_resolution=image_cond_model.proj_grid.image_resolution,
+            ).to(device)
+
+        try:
+            z_globals = []
+            z_proj_sum = None
+            z_proj_weight = None
+            for image, params in zip(images, camera_params):
+                cam_angle = self._camera_scalar_tensor(params["camera_angle_x"], device)
+                dist_tensor = self._camera_scalar_tensor(params["distance"], device)
+                scale_tensor = self._camera_scalar_tensor(params["mesh_scale"], device)
+                transform_matrix = self._camera_transform_tensor(params.get("transform_matrix"), device)
+                z_global, z_proj = image_cond_model(
+                    [image],
+                    camera_angle_x=cam_angle,
+                    distance=dist_tensor,
+                    mesh_scale=scale_tensor,
+                    transform_matrix=transform_matrix,
+                )
+                z_globals.append(z_global)
+                valid_mask = image_cond_model.proj_grid.projection_mask(
+                    camera_angle_x=cam_angle,
+                    distance=dist_tensor,
+                    mesh_scale=scale_tensor,
+                    transform_matrix=transform_matrix,
+                    batch_size=z_proj.shape[0],
+                ).unsqueeze(-1).to(dtype=z_proj.dtype)
+                z_proj.mul_(valid_mask)
+                z_proj_sum = z_proj if z_proj_sum is None else z_proj_sum.add_(z_proj)
+                z_proj_weight = valid_mask if z_proj_weight is None else z_proj_weight.add_(valid_mask)
+
+            z_global = torch.cat(z_globals, dim=1)
+            z_proj_weight.clamp_min_(1.0)
+            z_proj = z_proj_sum.div_(z_proj_weight)
+            grid_res = image_cond_model.grid_resolution
+        finally:
+            if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
+                image_cond_model.grid_resolution = orig_grid_res
+                image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
+                    grid_resolution=orig_grid_res,
+                    image_resolution=image_cond_model.proj_grid.image_resolution,
+                ).to(device)
+            if self.low_vram:
+                image_cond_model.cpu()
+
+        return z_global, z_proj, grid_res
+
+    @torch.no_grad()
+    def get_proj_cond_ss_multiview(
+        self,
+        images: Sequence[Image.Image],
+        camera_params: Sequence[dict],
+    ) -> dict:
+        z_global, z_proj, _ = self._extract_multiview_proj_features(
+            self.image_cond_model_ss,
+            images,
+            camera_params,
+        )
+        return {
+            'cond': {'global': z_global, 'proj': z_proj},
+            'neg_cond': {'global': torch.zeros_like(z_global), 'proj': torch.zeros_like(z_proj)},
+        }
+
+    @torch.no_grad()
+    def get_proj_cond_shape_multiview(
+        self,
+        image_cond_model: nn.Module,
+        images: Sequence[Image.Image],
+        coords: torch.Tensor,
+        camera_params: Sequence[dict],
+        grid_resolution_override: Optional[int] = None,
+    ) -> dict:
+        z_global, z_proj, grid_res = self._extract_multiview_proj_features(
+            image_cond_model,
+            images,
+            camera_params,
+            grid_resolution_override=grid_resolution_override,
+        )
+        B = z_global.shape[0]
+        z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
+        batch_indices = coords[:, 0].long()
+        x_coords = coords[:, 1].long()
+        y_coords = coords[:, 2].long()
+        z_coords = coords[:, 3].long()
+        z_proj_sparse = z_proj_grid[batch_indices, x_coords, y_coords, z_coords]
+        z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
+        return {
+            'cond': {'global': z_global, 'proj': z_proj_st},
+            'neg_cond': {'global': torch.zeros_like(z_global), 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
+        }
+
     # =========================================================================
     # Sampling methods (consistent with Trellis2)
     # =========================================================================
@@ -304,7 +551,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         resolution: int,
         num_samples: int = 1,
         sampler_params: dict = {},
-    ) -> torch.Tensor:
+        return_details: bool = False,
+    ) -> Union[torch.Tensor, SparseStructureSample]:
         """
         Sample sparse structures with the given conditioning.
         
@@ -337,14 +585,28 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         decoder = self.models['sparse_structure_decoder']
         if self.low_vram:
             decoder.to(self.device)
-        decoded = decoder(z_s)>0
+        decoded_scores = decoder(z_s)
         if self.low_vram:
             decoder.cpu()
-        if resolution != decoded.shape[2]:
-            ratio = decoded.shape[2] // resolution
-            decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
-        coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+        if decoded_scores.shape[1] != 1:
+            raise ValueError(
+                "Sparse structure decoder must return one occupancy channel, "
+                f"got shape {tuple(decoded_scores.shape)}."
+            )
+        if resolution != decoded_scores.shape[2]:
+            ratio = decoded_scores.shape[2] // resolution
+            decoded_scores = torch.nn.functional.max_pool3d(decoded_scores, ratio, ratio, 0)
+        scores = decoded_scores[:, 0]
+        occupancy = scores > 0
+        coords = torch.argwhere(occupancy).int()
 
+        if return_details:
+            return SparseStructureSample(
+                coords=coords,
+                occupancy=occupancy,
+                scores=scores,
+                resolution=resolution,
+            )
         return coords
 
     def sample_shape_slat(
@@ -572,21 +834,13 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         return ret
     
     @torch.no_grad()
-    def decode_latent(
+    def _decode_textured_meshes(
         self,
-        shape_slat: SparseTensor,
+        meshes: List[Mesh],
+        subs: List[SparseTensor],
         tex_slat: SparseTensor,
         resolution: int,
     ) -> List[MeshWithVoxel]:
-        """
-        Decode the latent codes.
-
-        Args:
-            shape_slat (SparseTensor): The structured latent for shape.
-            tex_slat (SparseTensor): The structured latent for texture.
-            resolution (int): The resolution of the output.
-        """
-        meshes, subs = self.decode_shape_slat(shape_slat, resolution)
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
         out_mesh = []
         torch.cuda.synchronize()
@@ -604,6 +858,33 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 )
             )
         return out_mesh
+
+    @staticmethod
+    def _copy_meshes_to_cpu(meshes: Sequence[Mesh]) -> List[Mesh]:
+        copied = []
+        for mesh in meshes:
+            vertex_attrs = None
+            if mesh.vertex_attrs is not None:
+                vertex_attrs = mesh.vertex_attrs.detach().cpu().clone()
+            copied.append(
+                Mesh(
+                    mesh.vertices.detach().cpu().clone(),
+                    mesh.faces.detach().cpu().clone(),
+                    vertex_attrs,
+                )
+            )
+        return copied
+
+    @torch.no_grad()
+    def decode_latent(
+        self,
+        shape_slat: SparseTensor,
+        tex_slat: SparseTensor,
+        resolution: int,
+    ) -> List[MeshWithVoxel]:
+        """Decode shape and texture latents into textured meshes."""
+        meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+        return self._decode_textured_meshes(meshes, subs, tex_slat, resolution)
     
     @torch.no_grad()
     def run(
@@ -670,6 +951,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             image = self.preprocess_image(image)
         torch.manual_seed(seed)
 
+        ss_sampler_params = {**sparse_structure_sampler_params}
+        spatial_control_mesh_path = ss_sampler_params.pop("spatial_control_mesh_path", None)
+        spatial_control_transform = ss_sampler_params.pop("spatial_control_transform", None)
+        spacecontrol_encoder_path = ss_sampler_params.pop("spacecontrol_encoder_path", None)
+
         # ---- Stage 1: Sparse Structure (proj) ----
         cond_ss = self.get_proj_cond_ss(
             [image],
@@ -677,10 +963,16 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             distance=distance,
             mesh_scale=mesh_scale,
         )
+        if spatial_control_mesh_path is not None:
+            cond_ss["control"] = self.encode_spatial_control(
+                spatial_control_mesh_path,
+                encoder_path=spacecontrol_encoder_path,
+                transform_matrix=spatial_control_transform,
+            )
         ss_res = 32
         coords = self.sample_sparse_structure(
             cond_ss, ss_res,
-            num_samples, sparse_structure_sampler_params
+            num_samples, ss_sampler_params
         )
         del cond_ss
         torch.cuda.empty_cache()
@@ -776,6 +1068,251 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         # ---- Stage 5: Decode ----
         res = actual_hr_resolution
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        if return_latent:
+            return out_mesh, (shape_slat, tex_slat, res)
+        else:
+            return out_mesh
+
+    @torch.no_grad()
+    def run_multiview_sparse_structure(
+        self,
+        images: Sequence[Image.Image],
+        camera_params: Sequence[dict],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        preprocess_image: bool = False,
+    ) -> SparseStructureSample:
+        """Run only the multi-view sparse-structure stage."""
+        if num_samples != 1:
+            raise ValueError("run_multiview_sparse_structure() currently supports num_samples=1.")
+        images, camera_params = self._normalize_multiview_inputs(images, camera_params)
+        assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
+        if preprocess_image:
+            images = [self.preprocess_image(image) for image in images]
+        torch.manual_seed(seed)
+
+        sampler_params = {**sparse_structure_sampler_params}
+        cond_ss = self.get_proj_cond_ss_multiview(images, camera_params)
+        sample = self.sample_sparse_structure(
+            cond_ss,
+            32,
+            num_samples,
+            sampler_params,
+            return_details=True,
+        )
+        del cond_ss
+        torch.cuda.empty_cache()
+        return sample
+
+    @torch.no_grad()
+    def run_multiview(
+        self,
+        images: Sequence[Image.Image],
+        camera_params: Sequence[dict],
+        num_samples: int = 1,
+        seed: int = 42,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = False,
+        return_latent: bool = False,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+        sparse_structure_override: Optional[torch.Tensor] = None,
+        capture_stages: bool = False,
+    ) -> Union[List[MeshWithVoxel], Tuple[List[MeshWithVoxel], tuple], MultiViewStageResult]:
+        """
+        Run the Pixal3D pipeline with multiple calibrated views.
+
+        The released checkpoint is still a single-view checkpoint. This method
+        performs the practical extension discussed in the Pixal3D issue tracker:
+        back-project each view into the same 3D grid and average projected
+        features while concatenating global image tokens.
+        """
+        ss_sampler_params = {**sparse_structure_sampler_params}
+        unsupported_spacecontrol = {
+            "spatial_control_mesh_path",
+            "spatial_control_transform",
+            "spacecontrol_encoder_path",
+            "space_control_tau",
+        }.intersection(ss_sampler_params)
+        if unsupported_spacecontrol:
+            raise ValueError(
+                "SpaceControl sampler parameters are not supported by run_multiview() "
+                f"in this experimental path: {sorted(unsupported_spacecontrol)}"
+            )
+        if num_samples != 1:
+            raise ValueError("run_multiview() currently supports num_samples=1.")
+        if capture_stages and return_latent:
+            raise ValueError("capture_stages and return_latent cannot be enabled together.")
+
+        images, camera_params = self._normalize_multiview_inputs(images, camera_params)
+
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        if pipeline_type == '1024_cascade':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+            hr_resolution = 1024
+        elif pipeline_type == '1536_cascade':
+            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
+            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+            hr_resolution = 1536
+        else:
+            raise ValueError(f"Invalid pipeline type for Pixal3D proj mode: {pipeline_type}. "
+                             f"Supported: '1024_cascade', '1536_cascade'.")
+
+        assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
+        assert self.image_cond_model_shape_512 is not None, "image_cond_model_shape_512 not set."
+        assert self.image_cond_model_shape_1024 is not None, "image_cond_model_shape_1024 not set."
+        assert self.image_cond_model_tex_1024 is not None, "image_cond_model_tex_1024 not set."
+
+        if preprocess_image:
+            images = [self.preprocess_image(image) for image in images]
+        torch.manual_seed(seed)
+
+        # ---- Stage 1: Sparse Structure (multi-view proj) ----
+        cond_ss = self.get_proj_cond_ss_multiview(images, camera_params)
+        ss_res = 32
+        coords = self.sample_sparse_structure(
+            cond_ss, ss_res,
+            num_samples, ss_sampler_params,
+        )
+        del cond_ss
+        torch.cuda.empty_cache()
+        if sparse_structure_override is not None:
+            coords = self._validate_sparse_structure_override(
+                sparse_structure_override,
+                resolution=ss_res,
+            )
+
+        # ---- Stage 2: Shape LR 512 (multi-view proj) ----
+        cond_shape_lr = self.get_proj_cond_shape_multiview(
+            self.image_cond_model_shape_512,
+            images,
+            coords,
+            camera_params,
+        )
+        lr_slat = self.sample_shape_slat(
+            cond_shape_lr, self.models['shape_slat_flow_model_512'],
+            coords, shape_slat_sampler_params
+        )
+        lr_token_count = int(lr_slat.coords.shape[0])
+        del cond_shape_lr
+        torch.cuda.empty_cache()
+
+        # ---- Stage 3a: Upsample LR → HR ----
+        if self.low_vram:
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        hr_coords = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
+        if self.low_vram:
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+
+        captured_shape_meshes: Dict[int, List[Mesh]] = {}
+        if capture_stages:
+            lr_meshes, lr_subs = self.decode_shape_slat(lr_slat, 512)
+            captured_shape_meshes[512] = self._copy_meshes_to_cpu(lr_meshes)
+            del lr_meshes, lr_subs
+            torch.cuda.empty_cache()
+
+        lr_resolution = 512
+        actual_hr_resolution = hr_resolution
+        while True:
+            grid_res = actual_hr_resolution // 16
+            quant_coords = torch.cat([
+                hr_coords[:, :1],
+                ((hr_coords[:, 1:] + 0.5) / lr_resolution * (grid_res - 1)).round().int(),
+            ], dim=1)
+            hr_coords_unique = quant_coords.unique(dim=0)
+            num_tokens = hr_coords_unique.shape[0]
+            if num_tokens < max_num_tokens or actual_hr_resolution == 1024:
+                break
+            actual_hr_resolution -= 128
+
+        actual_grid_res = actual_hr_resolution // 16
+        del lr_slat, hr_coords, quant_coords
+        torch.cuda.empty_cache()
+
+        # ---- Stage 3b: Shape HR (multi-view proj) ----
+        cond_shape_hr = self.get_proj_cond_shape_multiview(
+            self.image_cond_model_shape_1024,
+            images,
+            hr_coords_unique,
+            camera_params,
+            grid_resolution_override=actual_grid_res,
+        )
+        noise_hr = SparseTensor(
+            feats=torch.randn(hr_coords_unique.shape[0], self.models['shape_slat_flow_model_1024'].in_channels).to(self.device),
+            coords=hr_coords_unique,
+        )
+        sampler_params_hr = {**self.shape_slat_sampler_params, **shape_slat_sampler_params}
+        flow_model_hr = self.models['shape_slat_flow_model_1024']
+        if self.low_vram:
+            flow_model_hr.to(self.device)
+        hr_slat = self.shape_slat_sampler.sample(
+            flow_model_hr,
+            noise_hr,
+            **cond_shape_hr,
+            **sampler_params_hr,
+            verbose=True,
+            tqdm_desc=f"Sampling HR shape SLat (multi-view proj, {actual_hr_resolution})",
+        ).samples
+        if self.low_vram:
+            flow_model_hr.cpu()
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(hr_slat.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(hr_slat.device)
+        shape_slat = hr_slat * std + mean
+        hr_token_count = int(shape_slat.coords.shape[0])
+        del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique
+        torch.cuda.empty_cache()
+
+        # ---- Stage 4: Texture (multi-view proj) ----
+        tex_grid_res = actual_hr_resolution // 16
+        cond_tex = self.get_proj_cond_shape_multiview(
+            self.image_cond_model_tex_1024,
+            images,
+            shape_slat.coords,
+            camera_params,
+            grid_resolution_override=tex_grid_res,
+        )
+        tex_slat = self.sample_tex_slat(
+            cond_tex, self.models['tex_slat_flow_model_1024'],
+            shape_slat, tex_slat_sampler_params
+        )
+        tex_token_count = int(tex_slat.coords.shape[0])
+        del cond_tex
+        torch.cuda.empty_cache()
+
+        # ---- Stage 5: Decode ----
+        res = actual_hr_resolution
+        if capture_stages:
+            hr_meshes, hr_subs = self.decode_shape_slat(shape_slat, res)
+            captured_shape_meshes[res] = self._copy_meshes_to_cpu(hr_meshes)
+            out_mesh = self._decode_textured_meshes(
+                hr_meshes,
+                hr_subs,
+                tex_slat,
+                res,
+            )
+            return MultiViewStageResult(
+                final_meshes=out_mesh,
+                sparse_coords=coords.detach().cpu().clone(),
+                shape_meshes=captured_shape_meshes,
+                lr_resolution=512,
+                hr_resolution=res,
+                token_counts={
+                    "sparse_structure": int(coords.shape[0]),
+                    "shape_slat_lr": lr_token_count,
+                    "shape_slat_hr": hr_token_count,
+                    "texture_slat": tex_token_count,
+                },
+            )
+
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)

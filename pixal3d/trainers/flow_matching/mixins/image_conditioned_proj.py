@@ -176,6 +176,34 @@ class ProjGrid(nn.Module):
             [0.0, 0.0, 0.0, 1.0]
         ])
         self.register_buffer("front_view_transform_matrix", front_view_transform_matrix)
+
+    def projection_mask(
+        self,
+        camera_angle_x: torch.Tensor,
+        distance: torch.Tensor,
+        mesh_scale: torch.Tensor,
+        transform_matrix: Optional[torch.Tensor] = None,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
+        """Return the frustum-valid mask for every point in the projection grid."""
+        grid_points = self.grid_points.expand(batch_size, -1, -1)
+        grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2
+        if transform_matrix is None:
+            transform_matrix = self.front_view_transform_matrix.expand(batch_size, -1, -1).clone()
+            transform_matrix[:, 1, 3] = -distance
+        else:
+            transform_matrix = transform_matrix.to(device=grid_points.device, dtype=grid_points.dtype)
+            if transform_matrix.ndim == 2:
+                transform_matrix = transform_matrix.unsqueeze(0)
+            if transform_matrix.shape[0] == 1 and batch_size > 1:
+                transform_matrix = transform_matrix.expand(batch_size, -1, -1)
+        _, _, valid_mask = project_points_to_image_batch(
+            grid_points,
+            transform_matrix,
+            camera_angle_x,
+            self.image_resolution,
+        )
+        return valid_mask
         
     def forward(
         self, 
@@ -208,11 +236,16 @@ class ProjGrid(nn.Module):
         grid_points = self.grid_points
         grid_points = grid_points.expand(B, -1, -1)
         grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2  # Scale alignment
-        assert transform_matrix is None, "transform_matrix is not None"
         if transform_matrix is None:
             transform_matrix = self.front_view_transform_matrix
             transform_matrix = transform_matrix.expand(B, -1, -1).clone()
             transform_matrix[:, 1, 3] = -distance  # Set camera distance
+        else:
+            transform_matrix = transform_matrix.to(device=grid_points.device, dtype=grid_points.dtype)
+            if transform_matrix.ndim == 2:
+                transform_matrix = transform_matrix.unsqueeze(0)
+            if transform_matrix.shape[0] == 1 and B > 1:
+                transform_matrix = transform_matrix.expand(B, -1, -1)
             
         # Project to image coordinates (simulate Blender projection)
         image_points, depth, valid_mask = project_points_to_image_batch(
@@ -261,11 +294,16 @@ class ProjGrid(nn.Module):
         # Get projected points
         grid_points = self.grid_points.expand(B, -1, -1)
         grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2
-        assert transform_matrix is None, "transform_matrix is not None"
         if transform_matrix is None:
             transform_matrix = self.front_view_transform_matrix
             transform_matrix = transform_matrix.expand(B, -1, -1).clone()
             transform_matrix[:, 1, 3] = -distance
+        else:
+            transform_matrix = transform_matrix.to(device=grid_points.device, dtype=grid_points.dtype)
+            if transform_matrix.ndim == 2:
+                transform_matrix = transform_matrix.unsqueeze(0)
+            if transform_matrix.shape[0] == 1 and B > 1:
+                transform_matrix = transform_matrix.expand(B, -1, -1)
             
         image_points, depth, valid_mask = project_points_to_image_batch(
             grid_points, transform_matrix, camera_angle_x, self.image_resolution
@@ -493,7 +531,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            device = next(self.model.parameters()).device
+            image = torch.stack(image).to(device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -756,7 +795,8 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            device = next(self.dino_model.parameters()).device
+            image = torch.stack(image).to(device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
