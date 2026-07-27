@@ -25,3 +25,4 @@ Thumbs.db
 
 # Local worktrees
 /.worktrees/
+/outputs/projection_feature_ablation/

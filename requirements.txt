@@ -4,3 +4,5 @@ diffusers==0.37.1
 accelerate==1.13.0
 gradio
 plyfile==1.1.3
+lpips==0.1.4
+scikit-image==0.25.2
