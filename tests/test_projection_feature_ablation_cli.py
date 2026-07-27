@@ -368,12 +368,19 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 attrs=object(),
                 coords=object(),
             )
+            memory_events = []
+            pipeline_result = ([mesh], (object(), object(), 64))
+
+            def run_pipeline(*call_args, **call_kwargs):
+                memory_events.append("pipeline.run")
+                return pipeline_result
+
             pipeline = SimpleNamespace(
                 image_cond_model_shape_512=stages[0],
                 image_cond_model_shape_1024=stages[1],
                 image_cond_model_tex_1024=stages[2],
                 pbr_attr_layout={"base_color": slice(0, 3)},
-                run=Mock(return_value=([mesh], (object(), object(), 64))),
+                run=Mock(side_effect=run_pipeline),
             )
             prepared = runner.PreparedInput(
                 image_path=image_path,
@@ -408,7 +415,16 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 ],
             }
             fake_glb = FakeGlb()
-            memory_events = []
+            real_collect_feature_stats = runner.collect_pipeline_feature_stats
+            real_mesh_statistics = runner.mesh_statistics
+
+            def collect_feature_stats(call_pipeline):
+                memory_events.append("feature_stats")
+                return real_collect_feature_stats(call_pipeline)
+
+            def collect_mesh_statistics(vertices, faces):
+                memory_events.append("mesh_stats")
+                return real_mesh_statistics(vertices, faces)
 
             def to_glb_after_cache_release(**kwargs):
                 memory_events.append("to_glb")
@@ -428,6 +444,16 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                     runner.torch.cuda,
                     "empty_cache",
                     side_effect=lambda: memory_events.append("empty_cache"),
+                ),
+                patch.object(
+                    runner,
+                    "collect_pipeline_feature_stats",
+                    side_effect=collect_feature_stats,
+                ),
+                patch.object(
+                    runner,
+                    "mesh_statistics",
+                    side_effect=collect_mesh_statistics,
                 ),
                 patch.object(
                     runner,
@@ -461,8 +487,17 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
 
             self.assertEqual([stage.modes for stage in stages], [["low_only"]] * 3)
             self.assertEqual(
-                memory_events[:3],
-                ["gc", "empty_cache", "to_glb"],
+                memory_events,
+                [
+                    "pipeline.run",
+                    "feature_stats",
+                    "mesh_stats",
+                    "gc",
+                    "empty_cache",
+                    "to_glb",
+                    "gc",
+                    "empty_cache",
+                ],
             )
             manual_seed.assert_called_once_with(42)
             cuda_manual_seed.assert_called_once_with(42)
@@ -540,6 +575,128 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 np.asarray(Image.open(paths.conditioning_render)),
                 np.asarray(prepared.rgb),
+            )
+
+    def test_normal_vram_generate_condition_does_not_clear_cache_before_export(
+        self,
+    ):
+        class ReachedExport(RuntimeError):
+            pass
+
+        class Stage:
+            def set_proj_feature_mode(self, mode):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            Image.new("RGB", (8, 8), "white").save(image_path)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "pilot",
+                    "--images",
+                    str(image_path),
+                    "--output_root",
+                    str(root / "outputs"),
+                ]
+            )
+            mesh = SimpleNamespace(
+                vertices=np.array(
+                    [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+                ),
+                faces=np.array([[0, 1, 2]]),
+                attrs=object(),
+                coords=object(),
+            )
+            events = []
+
+            def run_pipeline(*call_args, **call_kwargs):
+                events.append("pipeline.run")
+                return [mesh], (object(), object(), 64)
+
+            pipeline = SimpleNamespace(
+                image_cond_model_shape_512=Stage(),
+                image_cond_model_shape_1024=Stage(),
+                image_cond_model_tex_1024=Stage(),
+                pbr_attr_layout={"base_color": slice(0, 3)},
+                run=Mock(side_effect=run_pipeline),
+            )
+            prepared = runner.PreparedInput(
+                image_path=image_path,
+                image_sha256="abc",
+                rgb=Image.new("RGB", (8, 8), "white"),
+                mask=Image.new("L", (8, 8), 255),
+                camera_params={
+                    "camera_angle_x": 0.75,
+                    "distance": 2.25,
+                    "mesh_scale": 1.0,
+                },
+            )
+            paths = runner.run_paths(
+                Path(args.output_root),
+                args.phase,
+                image_path,
+                42,
+                "concat",
+            )
+
+            def reach_export(**kwargs):
+                events.append("to_glb")
+                raise ReachedExport("export boundary reached")
+
+            with (
+                patch.object(runner.torch, "manual_seed"),
+                patch.object(runner.torch.cuda, "manual_seed_all"),
+                patch.object(
+                    runner,
+                    "collect_pipeline_feature_stats",
+                    side_effect=lambda pipeline: (
+                        events.append("feature_stats") or {}
+                    ),
+                ),
+                patch.object(
+                    runner,
+                    "mesh_statistics",
+                    side_effect=lambda vertices, faces: (
+                        events.append("mesh_stats") or {}
+                    ),
+                ),
+                patch.object(
+                    runner.gc,
+                    "collect",
+                    side_effect=lambda: events.append("gc"),
+                ),
+                patch.object(
+                    runner.torch.cuda,
+                    "empty_cache",
+                    side_effect=lambda: events.append("empty_cache"),
+                ),
+                patch.object(
+                    runner.o_voxel.postprocess,
+                    "to_glb",
+                    side_effect=reach_export,
+                ),
+                self.assertRaisesRegex(ReachedExport, "export boundary reached"),
+            ):
+                runner.generate_condition(
+                    pipeline,
+                    prepared,
+                    42,
+                    "concat",
+                    paths,
+                    args,
+                )
+
+            self.assertFalse(args.low_vram)
+            self.assertEqual(
+                events,
+                [
+                    "pipeline.run",
+                    "feature_stats",
+                    "mesh_stats",
+                    "to_glb",
+                ],
             )
 
     def test_one_image_matrix_prepares_once_and_completes_modes_in_paired_order(self):
