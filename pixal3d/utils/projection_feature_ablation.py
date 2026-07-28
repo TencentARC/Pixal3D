@@ -1,6 +1,7 @@
 """Shared state and pipeline helpers for projection-feature ablations."""
 
 import csv
+import fcntl
 import io
 import json
 import os
@@ -204,39 +205,49 @@ class ManifestStore:
 
     def __init__(self, path: Path):
         self.path = path
+        self.lock_path = path.with_name(f".{path.name}.lock")
 
     def start(self, run_id: str, metadata: dict[str, Any]) -> None:
-        manifest = self._load()
-        manifest["runs"][run_id] = {
-            "status": "running",
-            "metadata": metadata,
-            "started_at": _utc_timestamp(),
-        }
-        self._write(manifest)
+        def update(manifest: dict[str, Any]) -> None:
+            manifest["runs"][run_id] = {
+                "status": "running",
+                "metadata": metadata,
+                "started_at": _utc_timestamp(),
+            }
+
+        self._mutate(update)
 
     def complete(self, run_id: str, artifacts: dict[str, str]) -> None:
-        manifest = self._load()
-        run = manifest["runs"].setdefault(run_id, {})
-        run.update(
-            {
-                "status": "completed",
-                "artifacts": artifacts,
-                "completed_at": _utc_timestamp(),
-            }
-        )
-        self._write(manifest)
+        def update(manifest: dict[str, Any]) -> None:
+            run = manifest["runs"].setdefault(run_id, {})
+            run.update(
+                {
+                    "status": "completed",
+                    "artifacts": artifacts,
+                    "completed_at": _utc_timestamp(),
+                }
+            )
+
+        self._mutate(update)
 
     def fail(self, run_id: str, error: BaseException) -> None:
-        manifest = self._load()
-        run = manifest["runs"].setdefault(run_id, {})
-        run.update(
-            {
-                "status": "failed",
-                "error": f"{type(error).__name__}: {error}",
-                "failed_at": _utc_timestamp(),
-            }
-        )
-        self._write(manifest)
+        def update(manifest: dict[str, Any]) -> None:
+            run = manifest["runs"].setdefault(run_id, {})
+            run.update(
+                {
+                    "status": "failed",
+                    "error": f"{type(error).__name__}: {error}",
+                    "failed_at": _utc_timestamp(),
+                }
+            )
+
+        self._mutate(update)
+
+    def update_metadata(self, run_id: str, metadata: dict[str, Any]) -> None:
+        def update(manifest: dict[str, Any]) -> None:
+            manifest["runs"][run_id]["metadata"] = metadata
+
+        self._mutate(update)
 
     def is_complete(self, run_id: str, required: Sequence[Path]) -> bool:
         run = self._load()["runs"].get(run_id)
@@ -259,6 +270,17 @@ class ManifestStore:
             manifest_file.flush()
             os.fsync(manifest_file.fileno())
         temporary_path.replace(self.path)
+
+    def _mutate(self, update: Any) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                manifest = self._load()
+                update(manifest)
+                self._write(manifest)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def set_pipeline_proj_feature_mode(pipeline: Any, mode: str) -> None:

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -287,6 +288,30 @@ class ProjectionFeatureAblationTests(unittest.TestCase):
             self.assertEqual(data["runs"]["good"]["status"], "completed")
             self.assertEqual(data["runs"]["bad"]["status"], "failed")
             self.assertIn("generation failed", data["runs"]["bad"]["error"])
+
+    def test_manifest_concurrent_updates_preserve_every_run_and_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "manifest.json"
+
+            def write_run(index):
+                store = ManifestStore(path)
+                run_id = f"run-{index}"
+                store.start(run_id, {"index": index})
+                store.update_metadata(run_id, {"index": index, "elapsed": 0.25})
+                store.complete(run_id, {"result": f"{index}.glb"})
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(write_run, range(32)))
+
+            data = json.loads(path.read_text())
+            self.assertEqual(len(data["runs"]), 32)
+            self.assertTrue(
+                all(
+                    run["status"] == "completed"
+                    and run["metadata"]["elapsed"] == 0.25
+                    for run in data["runs"].values()
+                )
+            )
 
     def test_feature_stats_include_three_stages_and_are_copied(self):
         source = {

@@ -845,11 +845,7 @@ def run_matrix(
                     metadata["elapsed_seconds"] = float(
                         result.get("elapsed_seconds", 0.0)
                     )
-                    _update_manifest_metadata(
-                        manifest_path,
-                        run_id,
-                        metadata,
-                    )
+                    manifest.update_metadata(run_id, metadata)
                     manifest.complete(
                         run_id,
                         _artifact_mapping(
@@ -1018,16 +1014,6 @@ def _pipeline_settings(
         },
         "naf_target_sizes": naf_target_sizes,
     }
-
-
-def _update_manifest_metadata(
-    manifest_path: Path,
-    run_id: str,
-    metadata: dict[str, Any],
-) -> None:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["runs"][run_id]["metadata"] = metadata
-    _atomic_write_json(manifest_path, manifest)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
