@@ -59,6 +59,27 @@ class ProjectionConditioningAnalysisTests(unittest.TestCase):
             self.assertLess(metrics["mean_silhouette_iou"], 1.0)
             self.assertGreater(metrics["mean_rgb_mae"], 0.0)
 
+    def test_empty_candidate_has_zero_iou_and_undefined_foreground_mae(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            reference = np.full((32, 32, 3), 255, dtype=np.uint8)
+            reference[8:24, 8:24] = [20, 40, 60]
+            candidate = np.full((32, 32, 3), 255, dtype=np.uint8)
+            reference_path = root / "reference.png"
+            candidate_path = root / "candidate.png"
+            Image.fromarray(reference).save(reference_path)
+            Image.fromarray(candidate).save(candidate_path)
+
+            metrics = compute_render_divergence(
+                [reference_path],
+                [candidate_path],
+                lpips_model=None,
+            )
+
+            self.assertEqual(metrics["mean_silhouette_iou"], 0.0)
+            self.assertIsNone(metrics["mean_rgb_mae"])
+            self.assertIsNone(metrics["views"][0]["rgb_mae"])
+
     def test_surface_divergence_is_deterministic_and_detects_translation(self):
         reference = trimesh.creation.icosphere(subdivisions=1, radius=0.5)
         translated = reference.copy()

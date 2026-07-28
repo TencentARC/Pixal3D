@@ -163,7 +163,11 @@ def compute_render_divergence(
                 "candidate": str(candidate_path),
                 "ssim": float(metrics["ssim"]),
                 "silhouette_iou": float(metrics["silhouette_iou"]),
-                "rgb_mae": float(metrics["foreground_rgb_mae"]),
+                "rgb_mae": (
+                    None
+                    if metrics["foreground_rgb_mae"] is None
+                    else float(metrics["foreground_rgb_mae"])
+                ),
                 "lpips": (
                     None if metrics["lpips"] is None else float(metrics["lpips"])
                 ),
@@ -176,7 +180,9 @@ def compute_render_divergence(
         "mean_silhouette_iou": float(
             np.mean([view["silhouette_iou"] for view in views])
         ),
-        "mean_rgb_mae": float(np.mean([view["rgb_mae"] for view in views])),
+        "mean_rgb_mae": _mean_optional(
+            [view["rgb_mae"] for view in views]
+        ),
         "mean_lpips": float(np.mean(lpips_values)) if lpips_values else None,
         "views": views,
     }
