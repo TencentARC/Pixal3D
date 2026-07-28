@@ -343,21 +343,6 @@ def generate_condition(
     if args.low_vram:
         gc.collect()
         torch.cuda.empty_cache()
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipeline.pbr_attr_layout,
-        grid_size=resolution,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=args.decimation_target,
-        texture_size=args.texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        use_tqdm=True,
-    )
     rotation = np.array(
         [
             [-1, 0, 0, 0],
@@ -367,13 +352,46 @@ def generate_condition(
         ],
         dtype=np.float64,
     )
-    glb.apply_transform(rotation)
+    glb = None
+    export_fallback = None
     try:
-        glb.export(paths.glb, extension_webp=True)
-    except AttributeError as error:
-        if "_webp" not in str(error):
+        glb = o_voxel.postprocess.to_glb(
+            vertices=mesh.vertices,
+            faces=mesh.faces,
+            attr_volume=mesh.attrs,
+            coords=mesh.coords,
+            attr_layout=pipeline.pbr_attr_layout,
+            grid_size=resolution,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=args.decimation_target,
+            texture_size=args.texture_size,
+            remesh=True,
+            remesh_band=1,
+            remesh_project=0,
+            use_tqdm=True,
+        )
+        glb.apply_transform(rotation)
+        try:
+            glb.export(paths.glb, extension_webp=True)
+        except AttributeError as error:
+            if "_webp" not in str(error):
+                raise
+            glb.export(paths.glb, extension_webp=False)
+    except RuntimeError as error:
+        if not _is_cumesh_out_of_memory(error):
             raise
-        glb.export(paths.glb, extension_webp=False)
+        gc.collect()
+        torch.cuda.empty_cache()
+        export_fallback = _export_geometry_only_glb(
+            mesh,
+            paths.glb,
+            rotation,
+            face_target=args.decimation_target,
+        )
+        print(
+            "[Ablation] CuMesh OOM; exported geometry-only GLB fallback "
+            f"({export_fallback['faces']} faces)"
+        )
 
     simplify = getattr(mesh, "simplify", None)
     if callable(simplify):
@@ -423,11 +441,17 @@ def generate_condition(
     metrics = {
         "appearance": appearance_metrics,
         "mesh": geometry_metrics,
+        "export": {
+            "geometry_only_fallback": export_fallback is not None,
+            "fallback_mesh": export_fallback,
+        },
     }
     _atomic_write_json(paths.metrics, metrics)
     elapsed_seconds = time.perf_counter() - started_at
 
-    del mesh_list, mesh, renders, glb
+    del mesh_list, mesh, renders
+    if glb is not None:
+        del glb
     gc.collect()
     torch.cuda.empty_cache()
     return {
@@ -436,6 +460,49 @@ def generate_condition(
         "projection_stats": projection_stats,
         "empty_generation": False,
         "elapsed_seconds": elapsed_seconds,
+    }
+
+
+def _is_cumesh_out_of_memory(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "cumesh" in message and "out of memory" in message
+
+
+def _export_geometry_only_glb(
+    mesh: Any,
+    path: Path,
+    rotation: np.ndarray,
+    *,
+    face_target: int,
+) -> dict[str, Any]:
+    """CPU fallback for a valid geometry artifact when CuMesh exceeds VRAM."""
+
+    def as_numpy(value: Any) -> np.ndarray:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    fallback = trimesh.Trimesh(
+        vertices=as_numpy(mesh.vertices),
+        faces=as_numpy(mesh.faces),
+        process=False,
+    )
+    simplified = False
+    if len(fallback.faces) > face_target:
+        try:
+            fallback = fallback.simplify_quadric_decimation(
+                face_count=face_target
+            )
+            simplified = True
+        except (ImportError, ValueError, RuntimeError):
+            simplified = False
+    fallback.apply_transform(rotation)
+    fallback.export(path)
+    return {
+        "vertices": int(len(fallback.vertices)),
+        "faces": int(len(fallback.faces)),
+        "simplified": simplified,
+        "textured": False,
     }
 
 

@@ -480,6 +480,9 @@ def _flatten_run_metrics(run: CompletedRun, phase_dir: Path) -> dict[str, Any]:
         "mode": run.mode,
         "elapsed_seconds": run.metadata.get("elapsed_seconds"),
         "empty_generation": bool(metrics.get("empty_generation", False)),
+        "geometry_only_export_fallback": bool(
+            metrics.get("export", {}).get("geometry_only_fallback", False)
+        ),
     }
     for name, value in appearance.items():
         row[name] = value
@@ -1286,6 +1289,11 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
             "- All feature, global-only, and projection-only masks are inference-time OOD interventions.",
             "- DINO semantic similarity is not independent because Pixal3D uses DINOv3.",
             "- Input-view metrics do not validate unseen geometry.",
+            (
+                f"- {summary['geometry_only_export_fallback_count']} run(s) required "
+                "a geometry-only CPU GLB fallback after CuMesh OOM; generation and "
+                "renders are unchanged, but that GLB has no texture."
+            ),
             "",
             "## Reproducibility",
             "",
@@ -1417,6 +1425,9 @@ def analyze_phase(
         "seed_count": len({run.seed for run in runs}),
         "empty_generation_count": sum(
             bool(row["empty_generation"]) for row in rows
+        ),
+        "geometry_only_export_fallback_count": sum(
+            bool(row["geometry_only_export_fallback"]) for row in rows
         ),
         "modes": list(CAUSAL_MODE_ORDER),
         "model_path": first.get("model_path"),

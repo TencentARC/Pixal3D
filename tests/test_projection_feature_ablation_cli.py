@@ -745,6 +745,35 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             self.assertEqual(metrics["mesh"]["vertices"], 0)
             self.assertTrue(paths.projection_stats.exists())
 
+    def test_cumesh_oom_fallback_exports_loadable_geometry_only_glb(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = runner.trimesh.creation.icosphere(subdivisions=1)
+            mesh = SimpleNamespace(
+                vertices=source.vertices,
+                faces=source.faces,
+            )
+            path = Path(tmpdir) / "fallback.glb"
+            rotation = np.eye(4)
+
+            details = runner._export_geometry_only_glb(
+                mesh,
+                path,
+                rotation,
+                face_target=20,
+            )
+
+            loaded = runner.trimesh.load(path, force="mesh")
+            self.assertGreater(len(loaded.faces), 0)
+            self.assertFalse(details["textured"])
+            self.assertTrue(
+                runner._is_cumesh_out_of_memory(
+                    RuntimeError("[CuMesh] CUDA error: out of memory")
+                )
+            )
+            self.assertFalse(
+                runner._is_cumesh_out_of_memory(RuntimeError("ordinary failure"))
+            )
+
     def test_causal_required_artifacts_and_mapping_include_projection_stats(self):
         paths = runner.run_paths(
             Path("outputs"),
