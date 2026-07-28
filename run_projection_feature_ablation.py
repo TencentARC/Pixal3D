@@ -302,6 +302,12 @@ def generate_condition(
         "rescale_t": 3.0,
     }
     empty_error = None
+    previous_skip_fill_holes = getattr(
+        pipeline,
+        "skip_mesh_fill_holes",
+        False,
+    )
+    pipeline.skip_mesh_fill_holes = bool(args.geometry_only_export)
     try:
         try:
             mesh_list, (_, _, resolution) = pipeline.run(
@@ -322,6 +328,7 @@ def generate_condition(
     finally:
         if recorder is not None:
             recorder.close()
+        pipeline.skip_mesh_fill_holes = previous_skip_fill_holes
     if empty_error is not None:
         return _write_empty_generation(
             pipeline,

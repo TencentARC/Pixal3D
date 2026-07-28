@@ -928,7 +928,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         out_mesh = []
         torch.cuda.synchronize()
         for m, v in zip(meshes, tex_voxels):
-            m.fill_holes()
+            if not getattr(self, "skip_mesh_fill_holes", False):
+                m.fill_holes()
             out_mesh.append(
                 MeshWithVoxel(
                     m.vertices, m.faces,

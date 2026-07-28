@@ -780,6 +780,41 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 runner._is_cumesh_out_of_memory(RuntimeError("ordinary failure"))
             )
 
+    def test_geometry_only_pipeline_path_skips_cumesh_fill_holes(self):
+        pipeline = Pixal3DImageTo3DPipeline.__new__(
+            Pixal3DImageTo3DPipeline
+        )
+        pipeline.skip_mesh_fill_holes = True
+        pipeline.pbr_attr_layout = {"base_color": slice(0, 3)}
+        source_mesh = SimpleNamespace(
+            vertices=runner.torch.tensor(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+            ),
+            faces=runner.torch.tensor([[0, 1, 2]], dtype=runner.torch.int32),
+            fill_holes=Mock(),
+        )
+        voxel = SimpleNamespace(
+            coords=runner.torch.tensor(
+                [[0, 0, 0, 0]],
+                dtype=runner.torch.int32,
+            ),
+            feats=runner.torch.tensor([[0.5, 0.5, 0.5]]),
+            shape=runner.torch.Size([1]),
+            spatial_shape=runner.torch.Size([1, 1, 1]),
+        )
+        pipeline.decode_tex_slat = Mock(return_value=[voxel])
+
+        with patch.object(runner.torch.cuda, "synchronize"):
+            result = pipeline._decode_textured_meshes(
+                [source_mesh],
+                [],
+                object(),
+                1024,
+            )
+
+        source_mesh.fill_holes.assert_not_called()
+        self.assertEqual(len(result), 1)
+
     def test_causal_required_artifacts_and_mapping_include_projection_stats(self):
         paths = runner.run_paths(
             Path("outputs"),
