@@ -517,6 +517,35 @@ class ProjectionFeatureAblationTests(unittest.TestCase):
                 },
             )
 
+    def test_contact_sheet_supports_causal_mode_columns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            reference = root / "reference.png"
+            Image.new("RGB", (8, 8), "white").save(reference)
+            columns = (
+                "concat",
+                "global_only_e2e",
+                "projection_only_e2e",
+                "unconditional_e2e",
+            )
+            mode_frames = {}
+            for index, mode in enumerate(columns):
+                frame = root / f"{index}.png"
+                Image.new("RGB", (8, 8), (index * 20, 0, 0)).save(frame)
+                mode_frames[mode] = [frame]
+            output = root / "causal.png"
+
+            metadata = write_mode_contact_sheet(
+                reference,
+                mode_frames,
+                output,
+                columns=columns,
+            )
+
+            self.assertEqual(metadata["columns"], list(columns))
+            self.assertEqual(metadata["rows"], 2)
+            self.assertTrue(output.exists())
+
     def test_atomic_writers_do_not_reuse_stale_temporary_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

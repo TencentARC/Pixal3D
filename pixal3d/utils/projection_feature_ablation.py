@@ -569,9 +569,13 @@ def write_mode_contact_sheet(
     reference_path: Path,
     mode_frames: Mapping[str, Sequence[Path]],
     output_path: Path,
+    *,
+    columns: Sequence[str] = ("concat", "low_only", "high_only"),
 ) -> dict[str, Any]:
     """Write a fixed-column comparison sheet with one shared reference row."""
-    columns = ("concat", "low_only", "high_only")
+    columns = tuple(columns)
+    if not columns:
+        raise ValueError("Contact-sheet columns cannot be empty")
     try:
         frame_counts = {len(mode_frames[mode]) for mode in columns}
     except KeyError as error:

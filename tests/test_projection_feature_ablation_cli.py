@@ -61,6 +61,8 @@ def _write_successful_artifacts(
     feature_stats = {"shape_512": {"mode": mode}}
     paths.metrics.write_text(json.dumps(metrics))
     paths.feature_stats.write_text(json.dumps(feature_stats))
+    if args.phase == "causal_seed42":
+        paths.projection_stats.write_text(json.dumps({"shape_512": {}}))
     return {
         "metrics": metrics,
         "feature_stats": feature_stats,
@@ -684,6 +686,31 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             root / "manifest.json",
         )
 
+    def test_causal_contact_sheet_groups_separate_slot_and_factorial_modes(self):
+        self.assertEqual(
+            runner._contact_sheet_groups("causal_seed42"),
+            {
+                "slot-content": (
+                    "concat",
+                    "low_only",
+                    "high_to_low_slot",
+                    "low_to_high_slot",
+                    "high_only",
+                    "zero_both_fixed_ss",
+                ),
+                "global-projection": (
+                    "concat",
+                    "global_only_e2e",
+                    "projection_only_e2e",
+                    "unconditional_e2e",
+                ),
+            },
+        )
+        self.assertEqual(
+            runner._contact_sheet_groups("pilot"),
+            {"comparison": MODES},
+        )
+
     def test_normal_vram_generate_condition_does_not_clear_cache_before_export(
         self,
     ):
@@ -888,6 +915,87 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                     / "contact_sheets"
                     / f"{image_path.stem}-42.png"
                 ).exists()
+            )
+
+    def test_one_image_causal_matrix_writes_nine_runs_and_two_contact_sheets(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            Image.new("RGB", (8, 8), "white").save(image_path)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "causal_seed42",
+                    "--images",
+                    str(image_path),
+                    "--output_root",
+                    str(root / "outputs"),
+                ]
+            )
+            prepared = SimpleNamespace(
+                image_path=image_path,
+                image_sha256="abc",
+                rgb=Image.new("RGB", (8, 8), "black"),
+                mask=Image.new("L", (8, 8), 255),
+                camera_params={
+                    "camera_angle_x": 0.8,
+                    "distance": 2.0,
+                    "mesh_scale": 1.0,
+                },
+            )
+            generated = []
+
+            def generate(*call_args):
+                generated.append((call_args[2], call_args[3]))
+                return _write_successful_artifacts(*call_args)
+
+            with (
+                patch.object(runner, "prepare_input", return_value=prepared),
+                patch.object(runner, "generate_condition", side_effect=generate),
+                patch.object(runner, "write_experiment_report") as report,
+            ):
+                exit_code = runner.run_matrix(
+                    args,
+                    pipeline=object(),
+                    moge_model=object(),
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                generated,
+                [(42, mode) for mode in CAUSAL_MODE_SPECS],
+            )
+            phase_dir = Path(args.output_root) / "causal_seed42"
+            manifest = json.loads((phase_dir / "manifest.json").read_text())
+            self.assertEqual(len(manifest["runs"]), 9)
+            self.assertTrue(
+                all(
+                    run["status"] == "completed"
+                    and "projection_stats" in run["artifacts"]
+                    for run in manifest["runs"].values()
+                )
+            )
+            self.assertTrue(
+                (
+                    phase_dir
+                    / "contact_sheets"
+                    / f"{image_path.stem}-42-slot-content.png"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    phase_dir
+                    / "contact_sheets"
+                    / f"{image_path.stem}-42-global-projection.png"
+                ).exists()
+            )
+            report_rows = report.call_args.args[0]
+            self.assertEqual(
+                [row["mode"] for row in report_rows],
+                list(CAUSAL_MODE_SPECS),
+            )
+            self.assertTrue(
+                all(len(row["contact_sheets"]) == 2 for row in report_rows)
             )
 
     def test_failure_continues_and_resume_retries_only_incomplete_mode(self):

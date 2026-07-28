@@ -535,6 +535,27 @@ def _manifest_path(output_root: Path, phase: str) -> Path:
     return output_root / "manifest.json"
 
 
+def _contact_sheet_groups(phase: str) -> dict[str, tuple[str, ...]]:
+    if phase == "causal_seed42":
+        return {
+            "slot-content": (
+                "concat",
+                "low_only",
+                "high_to_low_slot",
+                "low_to_high_slot",
+                "high_only",
+                "zero_both_fixed_ss",
+            ),
+            "global-projection": (
+                "concat",
+                "global_only_e2e",
+                "projection_only_e2e",
+                "unconditional_e2e",
+            ),
+        }
+    return {"comparison": MODES}
+
+
 def _save_prepared_input(
     prepared: PreparedInput,
     output_root: Path,
@@ -847,26 +868,37 @@ def run_matrix(
             if stopped:
                 break
 
-            mode_paths = {
-                mode: run_paths(output_root, args.phase, image_path, seed, mode)
-                for mode in MODES
-            }
-            if all(
-                manifest.is_complete(
-                    _run_id(args.phase, image_path, seed, mode),
-                    _required_artifacts(
-                        mode_paths[mode],
-                        args.turntable_frames,
-                        phase=args.phase,
-                    ),
-                )
-                for mode in MODES
-            ):
+            for group_name, group_modes in _contact_sheet_groups(args.phase).items():
+                if not all(mode in args.modes for mode in group_modes):
+                    continue
+                mode_paths = {
+                    mode: run_paths(
+                        output_root,
+                        args.phase,
+                        image_path,
+                        seed,
+                        mode,
+                    )
+                    for mode in group_modes
+                }
+                if not all(
+                    manifest.is_complete(
+                        _run_id(args.phase, image_path, seed, mode),
+                        _required_artifacts(
+                            mode_paths[mode],
+                            args.turntable_frames,
+                            phase=args.phase,
+                        ),
+                    )
+                    for mode in group_modes
+                ):
+                    continue
+                suffix = "" if group_name == "comparison" else f"-{group_name}"
                 contact_sheet = (
                     output_root
                     / args.phase
                     / "contact_sheets"
-                    / f"{image_path.stem}-{seed}.png"
+                    / f"{image_path.stem}-{seed}{suffix}.png"
                 )
                 write_mode_contact_sheet(
                     reference_path,
@@ -876,29 +908,32 @@ def run_matrix(
                             / f"{frame_index:02d}.png"
                             for frame_index in range(args.turntable_frames)
                         ]
-                        for mode in MODES
+                        for mode in group_modes
                     },
                     contact_sheet,
+                    columns=group_modes,
                 )
         if stopped:
             break
 
     rows = _manifest_rows(manifest_path, requested_run_ids)
-    contact_sheets = {
-        (str(row.get("image")), int(row.get("seed", 0))): str(
-            output_root
-            / args.phase
-            / "contact_sheets"
-            / f"{Path(str(row.get('image'))).stem}-{row.get('seed')}.png"
-        )
-        for row in rows
-    }
     for row in rows:
-        contact_sheet = contact_sheets.get(
-            (str(row.get("image")), int(row.get("seed", 0)))
-        )
-        if contact_sheet and Path(contact_sheet).exists():
-            row["contact_sheet"] = contact_sheet
+        image_stem = Path(str(row.get("image"))).stem
+        seed = int(row.get("seed", 0))
+        sheets = []
+        for group_name in _contact_sheet_groups(args.phase):
+            suffix = "" if group_name == "comparison" else f"-{group_name}"
+            candidate = (
+                output_root
+                / args.phase
+                / "contact_sheets"
+                / f"{image_stem}-{seed}{suffix}.png"
+            )
+            if candidate.exists():
+                sheets.append(str(candidate))
+        if sheets:
+            row["contact_sheet"] = sheets[0]
+            row["contact_sheets"] = sheets
     write_experiment_report(rows, output_root / args.phase)
     return int(stopped or any(row["status"] != "completed" for row in rows))
 
