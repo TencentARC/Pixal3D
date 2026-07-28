@@ -13,6 +13,7 @@ from PIL import Image
 
 import run_projection_feature_ablation as runner
 from pixal3d.pipelines.pixal3d_image_to_3d import Pixal3DImageTo3DPipeline
+from pixal3d.pipelines.pixal3d_image_to_3d import EmptySparseStructureError
 from pixal3d.utils.projection_feature_ablation import PILOT_IMAGES
 from pixal3d.utils.projection_feature_ablation import CAUSAL_MODE_SPECS
 
@@ -648,6 +649,95 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
             setter.assert_called_once_with(pipeline, "global_only_e2e")
             recorder.start.assert_called_once_with()
             recorder.close.assert_called_once_with()
+
+    def test_empty_sparse_structure_is_recorded_as_a_completed_empty_generation(self):
+        class Stage:
+            naf_target_size = (512, 512)
+
+            def set_proj_feature_mode(self, mode):
+                self.mode = mode
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            Image.new("RGB", (32, 32), (40, 80, 120)).save(image_path)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "causal_seed42",
+                    "--images",
+                    str(image_path),
+                    "--output_root",
+                    str(root / "outputs"),
+                    "--device",
+                    "cpu",
+                    "--render_resolution",
+                    "32",
+                ]
+            )
+            stages = [Stage(), Stage(), Stage()]
+            pipeline = SimpleNamespace(
+                models={},
+                image_cond_model_shape_512=stages[0],
+                image_cond_model_shape_1024=stages[1],
+                image_cond_model_tex_1024=stages[2],
+                last_conditioning_mask_stats={
+                    "sparse_structure": {
+                        "global_enabled": True,
+                        "projection_enabled": False,
+                    }
+                },
+                set_conditioning_ablation=Mock(),
+                run=Mock(
+                    side_effect=EmptySparseStructureError(
+                        "sparse structure occupancy is empty"
+                    )
+                ),
+            )
+            prepared = runner.PreparedInput(
+                image_path=image_path,
+                image_sha256="abc",
+                rgb=Image.new("RGB", (32, 32), (40, 80, 120)),
+                mask=Image.new("L", (32, 32), 255),
+                camera_params={
+                    "camera_angle_x": 0.75,
+                    "distance": 2.25,
+                    "mesh_scale": 1.0,
+                },
+            )
+            paths = runner.run_paths(
+                Path(args.output_root),
+                args.phase,
+                image_path,
+                42,
+                "global_only_e2e",
+            )
+
+            with patch.object(runner, "_get_lpips_model", return_value=None):
+                result = runner.generate_condition(
+                    pipeline,
+                    prepared,
+                    42,
+                    "global_only_e2e",
+                    paths,
+                    args,
+                )
+
+            self.assertTrue(result["empty_generation"])
+            self.assertTrue(paths.glb.exists())
+            loaded = runner.trimesh.load(paths.glb, force="scene")
+            self.assertEqual(len(loaded.geometry), 1)
+            self.assertTrue(
+                all(
+                    (paths.turntable_dir / f"{index:02d}.png").exists()
+                    for index in range(8)
+                )
+            )
+            metrics = json.loads(paths.metrics.read_text())
+            self.assertTrue(metrics["empty_generation"])
+            self.assertEqual(metrics["appearance"]["silhouette_iou"], 0.0)
+            self.assertEqual(metrics["mesh"]["vertices"], 0)
+            self.assertTrue(paths.projection_stats.exists())
 
     def test_causal_required_artifacts_and_mapping_include_projection_stats(self):
         paths = runner.run_paths(

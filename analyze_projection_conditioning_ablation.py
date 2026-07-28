@@ -182,7 +182,9 @@ def compute_render_divergence(
     }
 
 
-def _as_mesh(mesh_or_path: trimesh.Trimesh | trimesh.Scene | str | Path) -> trimesh.Trimesh:
+def _as_mesh(
+    mesh_or_path: trimesh.Trimesh | trimesh.Scene | str | Path,
+) -> trimesh.Trimesh | None:
     loaded: trimesh.Trimesh | trimesh.Scene
     if isinstance(mesh_or_path, (str, Path)):
         loaded = trimesh.load(mesh_or_path, force="scene")
@@ -194,11 +196,11 @@ def _as_mesh(mesh_or_path: trimesh.Trimesh | trimesh.Scene | str | Path) -> trim
             isinstance(geometry, trimesh.Trimesh)
             for geometry in loaded.geometry.values()
         ):
-            raise ValueError("Mesh scene contains no triangle geometry")
+            return None
         loaded = loaded.to_mesh()
 
     if not isinstance(loaded, trimesh.Trimesh) or loaded.faces.size == 0:
-        raise ValueError("Expected a non-empty triangle mesh")
+        return None
     return loaded
 
 
@@ -216,6 +218,17 @@ def compute_surface_divergence(
 
     reference = _as_mesh(reference_mesh)
     candidate = _as_mesh(candidate_mesh)
+    if reference is None or candidate is None:
+        return {
+            "symmetric_chamfer_l1": None,
+            "normal_consistency": None,
+            "reference_to_candidate_mean": None,
+            "candidate_to_reference_mean": None,
+            "sample_count": int(sample_count),
+            "seed": int(seed),
+            "reference_empty": reference is None,
+            "candidate_empty": candidate is None,
+        }
     reference_points, reference_faces = trimesh.sample.sample_surface(
         reference, sample_count, seed=seed
     )
@@ -256,6 +269,8 @@ def compute_surface_divergence(
         "candidate_to_reference_mean": float(np.mean(candidate_to_reference)),
         "sample_count": int(sample_count),
         "seed": int(seed),
+        "reference_empty": False,
+        "candidate_empty": False,
     }
 
 
@@ -464,6 +479,7 @@ def _flatten_run_metrics(run: CompletedRun, phase_dir: Path) -> dict[str, Any]:
         "seed": run.seed,
         "mode": run.mode,
         "elapsed_seconds": run.metadata.get("elapsed_seconds"),
+        "empty_generation": bool(metrics.get("empty_generation", False)),
     }
     for name, value in appearance.items():
         row[name] = value
@@ -1158,7 +1174,11 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
         [
             "",
             "All values are means over six paired images. Baseline-relative metrics "
-            "measure change from Pixal3D `[L,H]`, not ground-truth 3D quality.",
+            "measure change from Pixal3D `[L,H]`, not ground-truth 3D quality. "
+            f"{summary['empty_generation_count']} runs decoded zero occupied sparse "
+            "voxels; they are represented by white renders and a point-only GLB, "
+            "while surface metrics are censored as `n/a` rather than assigned an "
+            "arbitrary finite distance.",
             "",
             "## Feature and checkpoint diagnostics",
             "",
@@ -1387,6 +1407,9 @@ def analyze_phase(
         "run_count": len(runs),
         "image_count": len({run.image_stem for run in runs}),
         "seed_count": len({run.seed for run in runs}),
+        "empty_generation_count": sum(
+            bool(row["empty_generation"]) for row in rows
+        ),
         "modes": list(CAUSAL_MODE_ORDER),
         "model_path": first.get("model_path"),
         "git_commit": first.get("git_commit"),

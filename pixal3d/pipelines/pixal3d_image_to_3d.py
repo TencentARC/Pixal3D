@@ -20,6 +20,10 @@ DEFAULT_SPACECONTROL_ENCODER_LOCAL = (
 DEFAULT_SPACECONTROL_ENCODER_HF = "microsoft/TRELLIS-image-large/ckpts/ss_enc_conv3d_16l8_fp16"
 
 
+class EmptySparseStructureError(RuntimeError):
+    """The sparse-structure decoder selected no occupied voxels."""
+
+
 @dataclass(frozen=True)
 class SparseStructureSample:
     coords: torch.Tensor
@@ -1055,6 +1059,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         )
         del cond_ss
         torch.cuda.empty_cache()
+        if coords.shape[0] == 0:
+            raise EmptySparseStructureError(
+                "sparse-structure decoding produced zero occupied voxels"
+            )
 
         # ---- Stage 2: Shape LR 512 (proj) ----
         cond_shape_lr = self.get_proj_cond_shape(

@@ -91,6 +91,21 @@ class ProjectionConditioningAnalysisTests(unittest.TestCase):
             identical_a["symmetric_chamfer_l1"],
         )
 
+    def test_surface_divergence_marks_empty_point_cloud_as_censored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_path = Path(tmpdir) / "empty.glb"
+            trimesh.points.PointCloud(np.zeros((1, 3))).export(empty_path)
+
+            result = compute_surface_divergence(
+                trimesh.creation.icosphere(subdivisions=1, radius=0.5),
+                empty_path,
+                sample_count=100,
+            )
+
+            self.assertTrue(result["candidate_empty"])
+            self.assertIsNone(result["symmetric_chamfer_l1"])
+            self.assertIsNone(result["normal_consistency"])
+
     def test_causal_contrasts_separate_slot_global_and_fixed_ss_effects(self):
         values = {
             "concat": 1.0,

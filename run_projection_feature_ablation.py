@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 import o_voxel
 import torch
+import trimesh
 from PIL import Image
 
 from inference import (
@@ -44,6 +45,7 @@ from pixal3d.utils.projection_feature_ablation import (
 )
 from pixal3d.utils import render_utils
 from pixal3d.renderers.pbr_mesh_renderer import EnvMap
+from pixal3d.pipelines.pixal3d_image_to_3d import EmptySparseStructureError
 from pixal3d.utils.sparse_slat_ablation import create_lpips_model
 
 
@@ -286,23 +288,38 @@ def generate_condition(
         "guidance_rescale": 0.0,
         "rescale_t": 3.0,
     }
+    empty_error = None
     try:
-        mesh_list, (_, _, resolution) = pipeline.run(
-            prepared.rgb,
-            camera_params=prepared.camera_params,
-            seed=seed,
-            sparse_structure_sampler_params=sparse_structure_sampler_params,
-            shape_slat_sampler_params=shape_slat_sampler_params,
-            tex_slat_sampler_params=tex_slat_sampler_params,
-            preprocess_image=False,
-            return_latent=True,
-            pipeline_type=args.pipeline_type,
-            max_num_tokens=args.max_num_tokens,
-        )
+        try:
+            mesh_list, (_, _, resolution) = pipeline.run(
+                prepared.rgb,
+                camera_params=prepared.camera_params,
+                seed=seed,
+                sparse_structure_sampler_params=sparse_structure_sampler_params,
+                shape_slat_sampler_params=shape_slat_sampler_params,
+                tex_slat_sampler_params=tex_slat_sampler_params,
+                preprocess_image=False,
+                return_latent=True,
+                pipeline_type=args.pipeline_type,
+                max_num_tokens=args.max_num_tokens,
+            )
+        except EmptySparseStructureError as error:
+            empty_error = error
         projection_stats = {} if recorder is None else recorder.finish()
     finally:
         if recorder is not None:
             recorder.close()
+    if empty_error is not None:
+        return _write_empty_generation(
+            pipeline,
+            prepared,
+            paths,
+            args,
+            condition_spec=condition_spec,
+            projection_stats=projection_stats,
+            reason=str(empty_error),
+            elapsed_seconds=time.perf_counter() - started_at,
+        )
     mesh = mesh_list[0]
     feature_stats = collect_pipeline_feature_stats(pipeline)
     if condition_spec is not None:
@@ -409,6 +426,90 @@ def generate_condition(
         "metrics": metrics,
         "feature_stats": feature_stats,
         "projection_stats": projection_stats,
+        "empty_generation": False,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
+def _write_empty_generation(
+    pipeline: Any,
+    prepared: PreparedInput,
+    paths: RunPaths,
+    args: argparse.Namespace,
+    *,
+    condition_spec: Any,
+    projection_stats: dict[str, Any],
+    reason: str,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """Persist an empty sparse-structure sample as a valid censored outcome."""
+
+    feature_stats: dict[str, Any] = {
+        "empty_generation": True,
+        "empty_reason": reason,
+        "conditioning_masks": dict(
+            getattr(pipeline, "last_conditioning_mask_stats", {})
+        ),
+    }
+    if condition_spec is not None:
+        feature_stats["conditioning_mode"] = asdict(condition_spec)
+    _atomic_write_json(paths.feature_stats, feature_stats)
+    if args.phase == "causal_seed42":
+        _atomic_write_json(paths.projection_stats, projection_stats)
+
+    resolution = args.render_resolution
+    white = np.full((resolution, resolution, 3), 255, dtype=np.uint8)
+    empty_mask = np.zeros((resolution, resolution), dtype=bool)
+    Image.fromarray(white, "RGB").save(paths.conditioning_render)
+    for frame_index in range(args.turntable_frames):
+        Image.fromarray(white, "RGB").save(
+            paths.turntable_dir / f"{frame_index:02d}.png"
+        )
+
+    reference_rgb = np.asarray(
+        prepared.rgb.resize((resolution, resolution), Image.Resampling.LANCZOS)
+    )
+    reference_mask = (
+        np.asarray(
+            prepared.mask.resize(
+                (resolution, resolution),
+                Image.Resampling.NEAREST,
+            )
+        )
+        > 0
+    )
+    appearance_metrics = compute_conditioning_metrics(
+        reference_rgb,
+        white,
+        reference_mask,
+        empty_mask,
+        lpips_model=_get_lpips_model(args.device),
+    )
+    mesh_metrics = {
+        "vertices": 0,
+        "faces": 0,
+        "connected_components": 0,
+        "bbox_min": None,
+        "bbox_max": None,
+        "bbox_extents": None,
+    }
+    metrics = {
+        "appearance": appearance_metrics,
+        "mesh": mesh_metrics,
+        "empty_generation": True,
+        "empty_reason": reason,
+    }
+    _atomic_write_json(paths.metrics, metrics)
+
+    empty_point = trimesh.points.PointCloud(np.zeros((1, 3), dtype=np.float32))
+    empty_point.metadata["empty_generation"] = True
+    empty_point.export(paths.glb)
+    print(f"[Ablation] Recorded empty sparse-structure generation: {reason}")
+    return {
+        "metrics": metrics,
+        "feature_stats": feature_stats,
+        "projection_stats": projection_stats,
+        "empty_generation": True,
         "elapsed_seconds": elapsed_seconds,
     }
 
@@ -844,6 +945,9 @@ def run_matrix(
                         )
                     metadata["elapsed_seconds"] = float(
                         result.get("elapsed_seconds", 0.0)
+                    )
+                    metadata["empty_generation"] = bool(
+                        result.get("empty_generation", False)
                     )
                     manifest.update_metadata(run_id, metadata)
                     manifest.complete(
