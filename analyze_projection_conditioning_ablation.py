@@ -1291,7 +1291,15 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
             "",
             f"- Phase directory: `{phase_dir}`",
             f"- Completed runs: {summary['run_count']} (6 images × 9 modes × seed 42)",
-            f"- Git revision: `{summary['git_commit']}`",
+            "- Git revisions: "
+            + ", ".join(f"`{revision}`" for revision in summary["git_commits"]),
+            (
+                "  - Earlier runs use the original causal runner; resumed empty or "
+                "subsequent runs use the revision that records zero-occupancy "
+                "outputs explicitly. The denoising interventions are unchanged."
+                if len(summary["git_commits"]) > 1
+                else ""
+            ),
             f"- Model: `{summary['model_path']}`",
             f"- Surface samples per pair: {summary['surface_samples']}",
             "- Full row-level values: [summary.csv](summary.csv)",
@@ -1413,6 +1421,13 @@ def analyze_phase(
         "modes": list(CAUSAL_MODE_ORDER),
         "model_path": first.get("model_path"),
         "git_commit": first.get("git_commit"),
+        "git_commits": sorted(
+            {
+                str(run.metadata.get("git_commit"))
+                for run in runs
+                if run.metadata.get("git_commit")
+            }
+        ),
         "surface_samples": surface_samples,
         "metric_directions": METRIC_DIRECTIONS,
         "mode_means": mode_means,

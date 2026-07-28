@@ -89,6 +89,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", metavar="CUDA_DEVICE")
     parser.add_argument("--low_vram", action="store_true")
     parser.add_argument(
+        "--allow_mixed_revision_resume",
+        action="store_true",
+        help=(
+            "Resume incomplete runs beside completed siblings from another Git "
+            "revision; every run retains its own revision metadata."
+        ),
+    )
+    parser.add_argument(
         "--pipeline_type",
         choices=("1024_cascade", "1536_cascade"),
         default="1024_cascade",
@@ -749,6 +757,7 @@ def _run_metadata(
         "camera": dict(prepared.camera_params),
         "git_commit": git_commit,
         "dirty_worktree": dirty_worktree,
+        "mixed_revision_resume": bool(args.allow_mixed_revision_resume),
     }
     if args.phase == "causal_seed42":
         metadata["conditioning_mode"] = asdict(CAUSAL_MODE_SPECS[mode])
@@ -779,6 +788,7 @@ def _preparation_failure_metadata(
         "camera": None,
         "git_commit": git_commit,
         "dirty_worktree": dirty_worktree,
+        "mixed_revision_resume": bool(args.allow_mixed_revision_resume),
     }
     metadata["resume_fingerprint"] = _resume_fingerprint(metadata)
     return metadata
@@ -898,12 +908,13 @@ def run_matrix(
             git_commit,
             dirty_worktree,
         )
-        _require_completed_siblings_resume_safe(
-            manifest_path,
-            args.phase,
-            image_path,
-            namespace_metadata,
-        )
+        if not args.allow_mixed_revision_resume:
+            _require_completed_siblings_resume_safe(
+                manifest_path,
+                args.phase,
+                image_path,
+                namespace_metadata,
+            )
         reference_path = _save_prepared_input(prepared, output_root, args.phase)
         for seed in args.seeds:
             for mode in args.modes:

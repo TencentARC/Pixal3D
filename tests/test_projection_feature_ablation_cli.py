@@ -187,6 +187,12 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
         self.assertEqual(args.decimation_target, 200000)
         self.assertEqual(args.texture_size, 2048)
         self.assertTrue(args.continue_on_error)
+        self.assertFalse(args.allow_mixed_revision_resume)
+        self.assertTrue(
+            runner.parse_args(
+                ["--phase", "pilot", "--allow_mixed_revision_resume"]
+            ).allow_mixed_revision_resume
+        )
         self.assertFalse(
             runner.parse_args(["--phase", "pilot", "--fail_fast"]).continue_on_error
         )
