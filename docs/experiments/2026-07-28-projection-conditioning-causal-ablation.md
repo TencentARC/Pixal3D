@@ -24,6 +24,26 @@ low slot의 비중도 각각 80.9%, 93.6%다. 반면 texture-1024는 weight 비�
 분명히 낮아진다. `high_only`는 H의 내용만 남기는 동시에 그것을 checkpoint가
 shape에 약하게 쓰도록 학습한 high slot에 놓기 때문에 변화가 더 크다.
 
+### 결과를 한 장으로 읽기
+
+![원시 feature 유사도, 학습된 slot 가중치, 실제 activation, 생성 결과를 연결한 요약](assets/projection-conditioning-causal-ablation/mechanism-summary.png)
+
+*그림 1. 왼쪽부터 원시 L/H feature의 cosine, projection weight의 low/high 비,
+단일-slot activation 중 low slot의 비중, concat 결과와의 생성 유사도다.*
+
+이 그림은 이번 실험의 핵심 인과 사슬을 보여준다.
+
+1. **원시 feature는 거의 같다.** 첫 패널의 cosine은 모든 stage에서 0.995 이상이다.
+2. **하지만 같은 위치에 투입되지 않는다.** 두 번째 패널에서 shape-1024의
+   low/high weight 비는 54.2배까지 벌어진다.
+3. **실제 block 출력도 shape에서 low slot이 지배한다.** 세 번째 패널의
+   shape-512와 shape-1024 low-slot 비중은 80.9%, 93.6%다. Texture는 50.2%다.
+4. **그래서 low-only가 더 비슷하다.** 마지막 패널에서 `[L,0]`은 `[0,H]`보다
+   8-view SSIM과 silhouette IoU 모두 concat에 가깝다.
+
+즉 첫 패널만 보면 L/H가 교환 가능해 보이지만, 두 번째와 세 번째 패널을 거치며
+checkpoint가 두 concat 위치에 전혀 다른 역할을 부여했다는 사실이 드러난다.
+
 ## 모델 구조와 condition 경로
 
 ### DINO CLS/register token 사용 여부
@@ -109,6 +129,25 @@ Chamfer와 normal consistency는 정답 품질이 아니라 concat 결과로부�
 `low_only`의 concat 대비 8-view SSIM이 `high_only`보다 높은 현상은 6개 이미지
 모두에서 관측됐다. 평균은 0.7529 대 0.6201이다.
 
+### 대표 qualitative 비교
+
+![Turtle과 desk-object에서 low/high content와 slot을 교차한 결과](assets/projection-conditioning-causal-ablation/slot-content-representative.png)
+
+*그림 2. 두 대표 입력의 conditioning-view 결과. 열은 input, concat,
+`[L,0]`, `[H,0]`, `[0,L]`, `[0,H]`, sparse structure를 고정한 `[0,0]`
+순서다.*
+
+그림 2는 다음 순서로 읽으면 된다.
+
+- **단순 low/high 비교:** `[L,0]` 대 `[0,H]`를 보면 low-only가 원본의 정체성,
+  silhouette, 색을 훨씬 많이 보존한다.
+- **같은 H content의 slot 비교:** `[H,0]` 대 `[0,H]`를 보면 H도 low slot에
+  놓았을 때 concat에 더 가까워진다. 즉 차이 일부는 resolution이 아니라 slot이다.
+- **같은 L content의 slot 비교:** `[L,0]` 대 `[0,L]`에서는 content가 같아도
+  high slot으로 이동하는 순간 형태와 재질이 크게 바뀐다.
+- **projection 제거의 위치:** `[0,0] fixed SS`도 물체 category는 유지한다.
+  sparse stage에서 projection으로 occupancy를 먼저 확보했기 때문이다.
+
 ### 시각적 전수 검사
 
 12개 contact sheet와 6개 conditioning-difference panel을 모두 확인했다.
@@ -136,6 +175,19 @@ quality가 높을수록 좋은 방향으로 부호를 통일한 paired contrast�
 | low-slot 내 content 효과: `[L,0] - [H,0]` | +0.0921 | [0.0579, 0.1309] |
 | high-slot 내 content 효과: `[0,L] - [0,H]` | -0.0138 | [-0.0314, -0.0002] |
 
+![Slot, global, fixed sparse-structure 효과의 paired bootstrap 결과](assets/projection-conditioning-causal-ablation/causal-findings.png)
+
+*그림 3. 막대가 0보다 높으면 앞의 조건이 더 좋은 방향이라는 뜻이며, 오차 막대는
+6개 이미지를 단위로 한 paired bootstrap 95% 구간이다. `low slot`은
+`[L,0]-[0,L]`, `high slot`은 `[H,0]-[0,H]`, `global`은
+global-only−unconditional, `fixed SS`는 fixed-SS−global-only다.*
+
+첫 번째 패널에서 low-slot gain은 +0.1466으로 high-slot gain +0.0408보다 크다.
+DINO와 silhouette에서도 같은 방향이다. 반면 global-only gain은 DINO와
+silhouette에서 음수다. 이는 정상 concat 모델에서 global token이 해롭다는 뜻이
+아니라, projection을 0으로 만든 OOD 조건에서 global token만으로는 sparse
+occupancy와 image identity를 복원하지 못했다는 뜻이다.
+
 L과 H를 같은 low slot에서 비교해도 L이 더 가깝기 때문에 content 차이가 전혀
 없는 것은 아니다. 그러나 `[L,0]` 대 `[0,H]` 차이를 순수 resolution 효과로
 부를 수는 없다. 가장 큰 항이 slot routing과 얽혀 있기 때문이다. high slot
@@ -146,6 +198,17 @@ L과 H를 같은 low slot에서 비교해도 L이 더 가깝기 때문에 conten
 global-only는 6개 이미지 모두 sparse occupancy가 0이어서 빈 결과가 됐다.
 반면 projection-only는 입력 silhouette IoU 0.9374와 DINO mean 0.8252를
 유지했다. concat의 0.9441, 0.8450에 매우 가깝다.
+
+![Global-only, projection-only, unconditional end-to-end 비교](assets/projection-conditioning-causal-ablation/factorial-representative.png)
+
+*그림 4. 동일 입력에서 global과 spatial projection을 end-to-end로 켜고 끈 결과.
+`G only`의 흰 칸은 rendering 오류가 아니라 실제 occupied sparse voxel이 0인
+결과다.*
+
+두 입력 모두 `P only`는 category와 주요 silhouette를 보존하지만 `G only`는
+foreground를 만들지 못한다. `unconditional`은 입력과 관계없이 같은
+우산/나무형 prior로 수렴한다. 따라서 `G only`의 약 0.5 SSIM은 물체 보존이 아니라
+흰 배경끼리 일치해 생기는 수치상의 착시다.
 
 이 결과를 “global token이 쓸모없다”로 해석하면 안 된다. projection을 완전히
 0으로 만드는 것은 학습 분포 밖의 개입이고, denoising cascade와 CFG는
@@ -198,9 +261,27 @@ gating 붕괴를 진단하며, 이후 decoder가 projection 없이 전혀 작동
   high-resolution 정보”를 구분한다.
 - ground-truth 3D가 있는 표본에서 geometry accuracy를 별도로 측정한다.
 
+## 시각 부록: 나머지 네 표본
+
+![나머지 네 이미지의 slot-content 전체 비교](assets/projection-conditioning-causal-ablation/slot-content-appendix.png)
+
+*그림 5. Palm, crab, coffee-object, plant에서도 대표 표본과 같은 열 순서를
+사용했다. 모든 이미지에서 `[L,0]`이 `[0,H]`보다 concat의 category와 appearance를
+더 많이 유지한다.*
+
+![나머지 네 이미지의 global-projection factorial 비교](assets/projection-conditioning-causal-ablation/factorial-appendix.png)
+
+*그림 6. 나머지 네 이미지에서도 `G only`는 모두 blank이고 `P only`는 입력
+category를 보존하며 unconditional은 동일한 우산/나무 prior로 수렴한다.*
+
+대표 두 표본과 부록 네 표본을 합치면 총 6개 전체 실험 이미지가 문서 안에
+포함된다. Turntable 전체 view와 pixel-difference panel은 아래 원본 산출물 링크에서
+추가로 확인할 수 있다.
+
 ## 시각화와 산출물
 
-- [통합 메커니즘 요약](../../outputs/projection_feature_ablation/causal_seed42/figures/mechanism_summary.png)
+- [체크인된 보고서 그림 디렉터리](assets/projection-conditioning-causal-ablation)
+- [원본 통합 메커니즘 요약](../../outputs/projection_feature_ablation/causal_seed42/figures/mechanism_summary.png)
 - [projection weight norm](../../outputs/projection_feature_ablation/causal_seed42/figures/projection_weight_norms.png)
 - [pretrained-block activation](../../outputs/projection_feature_ablation/causal_seed42/figures/projection_contributions.png)
 - [paired causal contrast](../../outputs/projection_feature_ablation/causal_seed42/figures/causal_findings.png)
