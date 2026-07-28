@@ -9,14 +9,17 @@ import torch
 from PIL import Image
 
 from pixal3d.utils.projection_feature_ablation import (
+    CAUSAL_MODE_SPECS,
     DEFAULT_MAIN_SEEDS,
     PILOT_IMAGES,
+    ConditioningModeSpec,
     ManifestStore,
     collect_pipeline_feature_stats,
     compute_conditioning_metrics,
     mesh_statistics,
     paired_mode_summary,
     run_paths,
+    set_pipeline_conditioning_mode,
     set_pipeline_proj_feature_mode,
     write_experiment_report,
     write_mode_contact_sheet,
@@ -69,6 +72,56 @@ class ProjectionFeatureAblationTests(unittest.TestCase):
         self.assertEqual(shape_512.modes, ["high_only"])
         self.assertEqual(shape_1024.modes, ["high_only"])
         self.assertEqual(tex_1024.modes, ["high_only"])
+
+    def test_causal_mode_specs_are_fixed_and_complete(self):
+        self.assertEqual(
+            tuple(CAUSAL_MODE_SPECS),
+            (
+                "concat",
+                "low_only",
+                "high_to_low_slot",
+                "low_to_high_slot",
+                "high_only",
+                "zero_both_fixed_ss",
+                "global_only_e2e",
+                "projection_only_e2e",
+                "unconditional_e2e",
+            ),
+        )
+        self.assertEqual(
+            CAUSAL_MODE_SPECS["global_only_e2e"],
+            ConditioningModeSpec("zero_both", True, False),
+        )
+        self.assertEqual(
+            CAUSAL_MODE_SPECS["projection_only_e2e"],
+            ConditioningModeSpec("concat", False, True),
+        )
+        self.assertEqual(
+            CAUSAL_MODE_SPECS["unconditional_e2e"],
+            ConditioningModeSpec("zero_both", False, False),
+        )
+
+    def test_causal_mode_setter_applies_slots_and_pipeline_switches(self):
+        stages = [_FakeCond(True) for _ in range(3)]
+
+        class Pipeline(SimpleNamespace):
+            def set_conditioning_ablation(
+                self,
+                *,
+                global_enabled,
+                ss_projection_enabled,
+            ):
+                self.switches = (global_enabled, ss_projection_enabled)
+
+        pipeline = Pipeline(
+            image_cond_model_shape_512=stages[0],
+            image_cond_model_shape_1024=stages[1],
+            image_cond_model_tex_1024=stages[2],
+        )
+        spec = set_pipeline_conditioning_mode(pipeline, "global_only_e2e")
+        self.assertEqual(spec, ConditioningModeSpec("zero_both", True, False))
+        self.assertEqual([stage.modes for stage in stages], [["zero_both"]] * 3)
+        self.assertEqual(pipeline.switches, (True, False))
 
     def test_manifest_requires_entry_and_all_artifacts_to_resume(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -20,7 +20,15 @@ from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 
 
-PROJ_FEATURE_MODES = ("concat", "low_only", "high_only")
+PROJ_FEATURE_LAYOUTS = {
+    "concat": ("low", "high"),
+    "low_only": ("low", "zero"),
+    "high_to_low_slot": ("high", "zero"),
+    "low_to_high_slot": ("zero", "low"),
+    "high_only": ("zero", "high"),
+    "zero_both": ("zero", "zero"),
+}
+PROJ_FEATURE_MODES = tuple(PROJ_FEATURE_LAYOUTS)
 
 
 def validate_proj_feature_mode(mode: str) -> str:
@@ -41,13 +49,16 @@ def combine_projected_features(
             "Low- and high-resolution projected features must have matching shapes; "
             f"got {tuple(z_proj_lr.shape)} and {tuple(z_proj_hr.shape)}."
         )
-    if mode == "concat":
-        low, high = z_proj_lr, z_proj_hr
-    elif mode == "low_only":
-        low, high = z_proj_lr, torch.zeros_like(z_proj_hr)
-    else:
-        low, high = torch.zeros_like(z_proj_lr), z_proj_hr
-    return torch.cat([low, high], dim=-1)
+    source_values = {
+        "low": z_proj_lr,
+        "high": z_proj_hr,
+        "zero": torch.zeros_like(z_proj_lr),
+    }
+    low_source, high_source = PROJ_FEATURE_LAYOUTS[mode]
+    return torch.cat(
+        [source_values[low_source], source_values[high_source]],
+        dim=-1,
+    )
 
 
 def _mean_token_l2(value: torch.Tensor) -> float:
@@ -72,9 +83,21 @@ def summarize_projected_features(
         dim=-1,
         eps=1e-8,
     ).mean()
-    excluded = masked_hr if mode == "low_only" else masked_lr
+    low_source, high_source = PROJ_FEATURE_LAYOUTS[mode]
+    low_zero = bool(torch.count_nonzero(masked_lr).item() == 0)
+    high_zero = bool(torch.count_nonzero(masked_hr).item() == 0)
+    zero_states = [
+        is_zero
+        for source, is_zero in (
+            (low_source, low_zero),
+            (high_source, high_zero),
+        )
+        if source == "zero"
+    ]
     return {
         "mode": mode,
+        "low_slot_source": low_source,
+        "high_slot_source": high_source,
         "tokens": int(z_proj.shape[-2]),
         "channels": int(z_proj.shape[-1]),
         "lr_mean_l2": lr_norm,
@@ -83,10 +106,10 @@ def summarize_projected_features(
         "lr_hr_mean_cosine": float(cosine.item()),
         "masked_lr_mean_l2": _mean_token_l2(masked_lr),
         "masked_hr_mean_l2": _mean_token_l2(masked_hr),
+        "low_slot_exact_zero": low_zero,
+        "high_slot_exact_zero": high_zero,
         "excluded_half_exact_zero": (
-            None
-            if mode == "concat"
-            else bool(torch.count_nonzero(excluded).item() == 0)
+            None if not zero_states else bool(all(zero_states))
         ),
     }
 

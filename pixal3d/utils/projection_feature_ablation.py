@@ -30,7 +30,35 @@ NAF_STAGE_ATTRS = {
     "shape_1024": "image_cond_model_shape_1024",
     "tex_1024": "image_cond_model_tex_1024",
 }
-_PROJ_FEATURE_MODES = ("concat", "low_only", "high_only")
+_PROJ_FEATURE_MODES = (
+    "concat",
+    "low_only",
+    "high_to_low_slot",
+    "low_to_high_slot",
+    "high_only",
+    "zero_both",
+)
+
+
+@dataclass(frozen=True)
+class ConditioningModeSpec:
+    feature_mode: str
+    global_enabled: bool
+    ss_projection_enabled: bool
+
+
+CAUSAL_MODE_SPECS = {
+    "concat": ConditioningModeSpec("concat", True, True),
+    "low_only": ConditioningModeSpec("low_only", True, True),
+    "high_to_low_slot": ConditioningModeSpec("high_to_low_slot", True, True),
+    "low_to_high_slot": ConditioningModeSpec("low_to_high_slot", True, True),
+    "high_only": ConditioningModeSpec("high_only", True, True),
+    "zero_both_fixed_ss": ConditioningModeSpec("zero_both", True, True),
+    "global_only_e2e": ConditioningModeSpec("zero_both", True, False),
+    "projection_only_e2e": ConditioningModeSpec("concat", False, True),
+    "unconditional_e2e": ConditioningModeSpec("zero_both", False, False),
+}
+_RUN_MODES = tuple(dict.fromkeys((*_PROJ_FEATURE_MODES, *CAUSAL_MODE_SPECS)))
 
 
 @dataclass(frozen=True)
@@ -45,8 +73,8 @@ class RunPaths:
 
 def run_paths(root: Path, phase: str, image: Path, seed: int, mode: str) -> RunPaths:
     """Return the output paths for one phase/image/seed/mode experiment run."""
-    if mode not in _PROJ_FEATURE_MODES:
-        choices = ", ".join(_PROJ_FEATURE_MODES)
+    if mode not in _RUN_MODES:
+        choices = ", ".join(_RUN_MODES)
         raise ValueError(f"proj_feature_mode must be one of {choices}")
     directory = root / phase / image.stem / str(int(seed)) / mode
     return RunPaths(
@@ -135,6 +163,29 @@ def set_pipeline_proj_feature_mode(pipeline: Any, mode: str) -> None:
         if not callable(setter):
             raise AttributeError(f"Missing projection-feature setter for stage: {stage}")
         setter(mode)
+
+
+def set_pipeline_conditioning_mode(
+    pipeline: Any,
+    mode: str,
+) -> ConditioningModeSpec:
+    """Apply one named causal intervention to a loaded pipeline."""
+    try:
+        spec = CAUSAL_MODE_SPECS[mode]
+    except KeyError as error:
+        choices = ", ".join(CAUSAL_MODE_SPECS)
+        raise ValueError(
+            f"conditioning mode must be one of {choices}; got {mode!r}"
+        ) from error
+    set_pipeline_proj_feature_mode(pipeline, spec.feature_mode)
+    setter = getattr(pipeline, "set_conditioning_ablation", None)
+    if not callable(setter):
+        raise AttributeError("Pipeline is missing set_conditioning_ablation")
+    setter(
+        global_enabled=spec.global_enabled,
+        ss_projection_enabled=spec.ss_projection_enabled,
+    )
+    return spec
 
 
 def collect_pipeline_feature_stats(pipeline: Any) -> dict[str, Any]:

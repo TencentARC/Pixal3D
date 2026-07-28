@@ -19,34 +19,43 @@ class ProjectionFeatureModeTests(unittest.TestCase):
         self.hr = torch.tensor([[[5.0, 6.0], [7.0, 8.0]]])
 
     def test_valid_modes_are_fixed(self):
-        self.assertEqual(PROJ_FEATURE_MODES, ("concat", "low_only", "high_only"))
+        self.assertEqual(
+            PROJ_FEATURE_MODES,
+            (
+                "concat",
+                "low_only",
+                "high_to_low_slot",
+                "low_to_high_slot",
+                "high_only",
+                "zero_both",
+            ),
+        )
         for mode in PROJ_FEATURE_MODES:
             self.assertEqual(validate_proj_feature_mode(mode), mode)
 
     def test_invalid_mode_lists_valid_choices(self):
         with self.assertRaisesRegex(
             ValueError,
-            "proj_feature_mode must be one of concat, low_only, high_only",
+            "proj_feature_mode must be one of concat, low_only, "
+            "high_to_low_slot, low_to_high_slot, high_only, zero_both",
         ):
             validate_proj_feature_mode("average")
 
-    def test_concat_preserves_both_branches(self):
-        actual = combine_projected_features(self.lr, self.hr, "concat")
-        torch.testing.assert_close(actual, torch.cat([self.lr, self.hr], dim=-1))
-
-    def test_low_only_zeros_high_half(self):
-        actual = combine_projected_features(self.lr, self.hr, "low_only")
-        torch.testing.assert_close(
-            actual,
-            torch.cat([self.lr, torch.zeros_like(self.hr)], dim=-1),
-        )
-
-    def test_high_only_zeros_low_half(self):
-        actual = combine_projected_features(self.lr, self.hr, "high_only")
-        torch.testing.assert_close(
-            actual,
-            torch.cat([torch.zeros_like(self.lr), self.hr], dim=-1),
-        )
+    def test_all_slot_layouts_are_exact(self):
+        zero = torch.zeros_like(self.lr)
+        expected = {
+            "concat": torch.cat([self.lr, self.hr], dim=-1),
+            "low_only": torch.cat([self.lr, zero], dim=-1),
+            "high_to_low_slot": torch.cat([self.hr, zero], dim=-1),
+            "low_to_high_slot": torch.cat([zero, self.lr], dim=-1),
+            "high_only": torch.cat([zero, self.hr], dim=-1),
+            "zero_both": torch.cat([zero, zero], dim=-1),
+        }
+        for mode, wanted in expected.items():
+            with self.subTest(mode=mode):
+                actual = combine_projected_features(self.lr, self.hr, mode)
+                torch.testing.assert_close(actual, wanted)
+                self.assertEqual(actual.shape[-1], self.lr.shape[-1] * 2)
 
     def test_mismatched_branch_shapes_fail(self):
         with self.assertRaisesRegex(ValueError, "matching shapes"):
@@ -61,7 +70,39 @@ class ProjectionFeatureModeTests(unittest.TestCase):
         self.assertGreater(stats["hr_mean_l2"], 0.0)
         self.assertEqual(stats["masked_lr_mean_l2"], stats["lr_mean_l2"])
         self.assertEqual(stats["masked_hr_mean_l2"], 0.0)
+        self.assertEqual(stats["low_slot_source"], "low")
+        self.assertEqual(stats["high_slot_source"], "zero")
+        self.assertFalse(stats["low_slot_exact_zero"])
+        self.assertTrue(stats["high_slot_exact_zero"])
         self.assertTrue(stats["excluded_half_exact_zero"])
+
+    def test_summary_records_each_slot_source_and_zero_state(self):
+        expected = {
+            "concat": ("low", "high", False, False),
+            "low_only": ("low", "zero", False, True),
+            "high_to_low_slot": ("high", "zero", False, True),
+            "low_to_high_slot": ("zero", "low", True, False),
+            "high_only": ("zero", "high", True, False),
+            "zero_both": ("zero", "zero", True, True),
+        }
+        for mode, wanted in expected.items():
+            with self.subTest(mode=mode):
+                combined = combine_projected_features(self.lr, self.hr, mode)
+                stats = summarize_projected_features(
+                    self.lr,
+                    self.hr,
+                    combined,
+                    mode,
+                )
+                self.assertEqual(
+                    (
+                        stats["low_slot_source"],
+                        stats["high_slot_source"],
+                        stats["low_slot_exact_zero"],
+                        stats["high_slot_exact_zero"],
+                    ),
+                    wanted,
+                )
 
 
 class _FakeBackbone(nn.Module):
@@ -137,7 +178,10 @@ class DinoV3ProjFeatureExtractorTests(unittest.TestCase):
         expected = {
             "concat": torch.tensor([[[1.0, 1.0, 5.0, 5.0]]]),
             "low_only": torch.tensor([[[1.0, 1.0, 0.0, 0.0]]]),
+            "high_to_low_slot": torch.tensor([[[5.0, 5.0, 0.0, 0.0]]]),
+            "low_to_high_slot": torch.tensor([[[0.0, 0.0, 1.0, 1.0]]]),
             "high_only": torch.tensor([[[0.0, 0.0, 5.0, 5.0]]]),
+            "zero_both": torch.zeros(1, 1, 4),
         }
         for mode, wanted in expected.items():
             model.set_proj_feature_mode(mode)
