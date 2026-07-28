@@ -1041,6 +1041,129 @@ def _plot_causal_findings(
     return path
 
 
+def _plot_mechanism_summary(
+    feature_diagnostics: Mapping[str, Any],
+    projection_diagnostics: Mapping[str, Any],
+    mode_means: Mapping[str, Mapping[str, float | None]],
+    figures_dir: Path,
+) -> Path:
+    stages = [
+        stage
+        for stage in ("shape_512", "shape_1024", "tex_1024")
+        if stage in feature_diagnostics["stage_means"]
+        and stage in projection_diagnostics["stage_summary"]
+        and stage in projection_diagnostics["contributions"]
+    ]
+    labels = {
+        "shape_512": "shape 512",
+        "shape_1024": "shape 1024",
+        "tex_1024": "texture 1024",
+    }
+    colors = ["#4477AA", "#66CCEE", "#CC6677"]
+
+    feature_cosines = [
+        feature_diagnostics["stage_means"][stage]["lr_hr_mean_cosine"]
+        for stage in stages
+    ]
+    weight_ratios = [
+        projection_diagnostics["stage_summary"][stage][
+            "mean_low_to_high_ratio"
+        ]
+        for stage in stages
+    ]
+    low_slot_shares = []
+    for stage in stages:
+        contributions = projection_diagnostics["contributions"][stage]
+        low_values = list(contributions["low_only"].values())
+        high_values = list(contributions["high_only"].values())
+        low_mean = float(np.mean(low_values))
+        high_mean = float(np.mean(high_values))
+        low_slot_shares.append(low_mean / (low_mean + high_mean))
+
+    output_modes = (
+        "concat",
+        "low_only",
+        "high_only",
+        "zero_both_fixed_ss",
+        "projection_only_e2e",
+        "global_only_e2e",
+        "unconditional_e2e",
+    )
+    output_ssim = [
+        mode_means[mode]["render_baseline_ssim"] for mode in output_modes
+    ]
+    output_iou = [
+        mode_means[mode]["render_baseline_silhouette_iou"]
+        for mode in output_modes
+    ]
+
+    figure, axes = plt.subplots(
+        1,
+        4,
+        figsize=(18, 4.6),
+        constrained_layout=True,
+    )
+    x = np.arange(len(stages))
+
+    axes[0].bar(x, feature_cosines, color=colors)
+    axes[0].set_ylim(0.99, 1.0)
+    axes[0].set_xticks(x, [labels[stage] for stage in stages], rotation=25, ha="right")
+    axes[0].set_ylabel("mean token cosine")
+    axes[0].set_title("Raw L/H similarity")
+    for index, value in enumerate(feature_cosines):
+        axes[0].text(index, value + 0.00012, f"{value:.4f}", ha="center", fontsize=8)
+
+    axes[1].bar(x, weight_ratios, color=colors)
+    axes[1].set_yscale("log")
+    axes[1].set_xticks(x, [labels[stage] for stage in stages], rotation=25, ha="right")
+    axes[1].set_ylabel("low/high Frobenius ratio (log)")
+    axes[1].set_title("Learned slot weighting")
+    for index, value in enumerate(weight_ratios):
+        axes[1].text(index, value * 1.12, f"{value:.1f}×", ha="center", fontsize=8)
+
+    axes[2].bar(x, low_slot_shares, color=colors)
+    axes[2].axhline(0.5, color="black", linewidth=0.8, linestyle="--")
+    axes[2].set_ylim(0, 1)
+    axes[2].set_xticks(x, [labels[stage] for stage in stages], rotation=25, ha="right")
+    axes[2].set_ylabel("L2([L,0]) / (L2([L,0]) + L2([0,H]))")
+    axes[2].set_title("Single-slot activation share")
+    for index, value in enumerate(low_slot_shares):
+        axes[2].text(index, value + 0.025, f"{100 * value:.1f}%", ha="center", fontsize=8)
+
+    output_x = np.arange(len(output_modes))
+    width = 0.38
+    axes[3].bar(
+        output_x - width / 2,
+        output_ssim,
+        width,
+        color="#4477AA",
+        label="8-view SSIM",
+    )
+    axes[3].bar(
+        output_x + width / 2,
+        output_iou,
+        width,
+        color="#EECC66",
+        label="silhouette IoU",
+    )
+    axes[3].set_ylim(0, 1.05)
+    axes[3].set_xticks(
+        output_x,
+        [MODE_LABELS[mode] for mode in output_modes],
+        rotation=35,
+        ha="right",
+    )
+    axes[3].set_ylabel("similarity to [L,H]")
+    axes[3].set_title("Generated-output similarity")
+    axes[3].legend(fontsize=8)
+
+    for axis in axes:
+        axis.grid(axis="y", alpha=0.25)
+    path = figures_dir / "mechanism_summary.png"
+    _save_figure(figure, path)
+    return path
+
+
 def _serialize_rows_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
     fieldnames = sorted({key for row in rows for key in row})
     temporary = path.with_name(f".{path.name}.tmp")
@@ -1086,6 +1209,12 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
     ]
     fixed_ss = means["zero_both_fixed_ss"]["render_baseline_ssim"]
     global_ssim = means["global_only_e2e"]["render_baseline_ssim"]
+    projection_input_iou = means["projection_only_e2e"]["silhouette_iou"]
+    projection_semantic = means["projection_only_e2e"][
+        "dino_turntable_mean_cosine"
+    ]
+    baseline_input_iou = means["concat"]["silhouette_iou"]
+    baseline_semantic = means["concat"]["dino_turntable_mean_cosine"]
 
     low_closer = bool(low_baseline is not None and high_baseline is not None and low_baseline > high_baseline)
     slot_recovery = bool(
@@ -1128,6 +1257,19 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
             "interchangeable resolution buckets. It does not show that native DINO "
             "features are intrinsically better than NAF features: every intervention "
             "is applied to a checkpoint trained on `[L,H]`."
+        ),
+        "",
+        (
+            f"All {summary['empty_generation_count']} empty generations were `G only`: "
+            "global tokens without spatial projection decoded no occupied sparse voxels "
+            "for any image. By contrast, `P only` retained input silhouette IoU "
+            f"{_format_number(projection_input_iou)} vs "
+            f"{_format_number(baseline_input_iou)} for `[L,H]`, and DINO mean "
+            f"{_format_number(projection_semantic)} vs "
+            f"{_format_number(baseline_semantic)}. Global context is therefore not "
+            "an independently sufficient semantic pathway under this intervention; "
+            "its normal contribution must be interpreted conditional on spatial "
+            "projection."
         ),
         "",
         "## Model and conditioning architecture",
@@ -1255,6 +1397,7 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
             "- [Normalized mode/metric heatmap](figures/mode_metric_heatmap.png)",
             "- [Projection weight norms](figures/projection_weight_norms.png)",
             "- [Projection contribution norms](figures/projection_contributions.png)",
+            "- [Mechanism summary](figures/mechanism_summary.png)",
             "- [Compact causal findings](figures/causal_findings.png)",
             "",
             "Per-image conditioning difference panels and both contact-sheet families "
@@ -1269,24 +1412,44 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
             "`high_only` changes both content and routing, whereas `low_only` retains "
             "the branch and slot most directly aligned with the native DINO field.",
             "",
-            "Global-only and projection-only cells further show that semantic/global "
-            "and view-aligned/spatial pathways are complementary under this checkpoint. "
-            "Their factorial difference should not be read as additive because the "
-            "denoising cascade and CFG are nonlinear.",
+            "The end-to-end factorial is strongly non-additive. `G only` is not merely "
+            "weaker than `P only`; it collapses sparse occupancy in 6/6 cases and is "
+            "worse than the unconditional prior on DINO similarity and silhouette IoU. "
+            "This does not imply that global tokens harm the normal `[L,H]` model, "
+            "because zeroing projection is an out-of-distribution intervention. It "
+            "does imply that a standalone global-path effect is not identified here. "
+            "The valid conclusion is that spatial projection carries most directly "
+            "recoverable image-specific signal, while the global path operates "
+            "conditionally and nonlinearly with it.",
+            "",
+            "The fixed-sparse-structure cell localizes much of the `G only` failure. "
+            "When sparse occupancy is inherited from the normally conditioned first "
+            "stage, zeroing both later slots still produces recognizable objects "
+            f"(eight-view SSIM {_format_number(fixed_ss)}). Thus the blank `G only` "
+            "outputs primarily diagnose sparse-stage occupancy gating, not a general "
+            "inability of the later shape and texture decoders to run without "
+            "projection features.",
             "",
             "## Research significance",
             "",
             "Confirmed within this sample: concat-trained multiresolution halves are "
             "not safely interpretable as exchangeable feature resolutions; NAF H is "
             "derived from, and highly correlated with, L; learned slot transforms can "
-            "amplify a small representational difference into a large generation change.",
+            "amplify a small representational difference into a large generation "
+            "change. Shape projections are especially low-slot dominated (mean "
+            "low/high weight ratios 6.25× at shape-512 and 54.19× at shape-1024), "
+            "whereas texture-1024 is much more balanced (1.20×). This explains why "
+            "`low_only` preserves geometry and semantics surprisingly well while "
+            "still losing appearance fidelity: it retains the dominant shape route "
+            "but removes roughly half of the texture-stage projected activation.",
             "",
-            "Plausible next-step implications: training with independent branch dropout, "
-            "slot permutation, learned gates, or contribution balancing would make "
-            "low/high utility identifiable rather than confounded with the training "
-            "distribution. Retraining low-only and high-only variants is required to "
-            "test branch capacity. A genuinely independent high-resolution encoder is "
-            "required to test resolution as new information rather than NAF refinement.",
+            "Methodologically, this experiment separates branch content from concat "
+            "position: `[H,0]` and `[0,L]` show that a nominal low-vs-high comparison "
+            "without slot swaps is confounded by learned routing. For a clean capacity "
+            "claim, retrain matched low-only and high-only models or train the concat "
+            "model with independent branch dropout and slot permutation. A genuinely "
+            "independent high-resolution encoder is also required to test resolution "
+            "as new information rather than NAF refinement.",
             "",
             "## Limitations",
             "",
@@ -1308,9 +1471,10 @@ def _report_markdown(summary: Mapping[str, Any], phase_dir: Path) -> str:
             "- Git revisions: "
             + ", ".join(f"`{revision}`" for revision in summary["git_commits"]),
             (
-                "  - Earlier runs use the original causal runner; resumed empty or "
-                "subsequent runs use the revision that records zero-occupancy "
-                "outputs explicitly. The denoising interventions are unchanged."
+                "  - Runs were resumed across implementation-hardening revisions "
+                "(atomic manifest writes, explicit zero-occupancy outcomes, and "
+                "geometry-only export fallback). The conditioning tensors and "
+                "denoising interventions are unchanged."
                 if len(summary["git_commits"]) > 1
                 else ""
             ),
@@ -1420,6 +1584,12 @@ def analyze_phase(
         _plot_metric_heatmap(rows, figures_dir),
         _plot_projection_weights(projection_diagnostics, figures_dir),
         _plot_projection_contributions(projection_diagnostics, figures_dir),
+        _plot_mechanism_summary(
+            feature_diagnostics,
+            projection_diagnostics,
+            mode_means,
+            figures_dir,
+        ),
         _plot_causal_findings(causal, figures_dir),
         *_plot_conditioning_differences(runs, phase_dir, figures_dir),
     ]
