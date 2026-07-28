@@ -7,13 +7,17 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 from PIL import Image
+from torch import nn
 
+from pixal3d.modules.sparse import SparseTensor
+from pixal3d.pipelines.pixal3d_image_to_3d import Pixal3DImageTo3DPipeline
 from pixal3d.utils.projection_feature_ablation import (
     CAUSAL_MODE_SPECS,
     DEFAULT_MAIN_SEEDS,
     PILOT_IMAGES,
     ConditioningModeSpec,
     ManifestStore,
+    ProjectionContributionRecorder,
     collect_pipeline_feature_stats,
     compute_conditioning_metrics,
     mesh_statistics,
@@ -55,6 +59,7 @@ class ProjectionFeatureAblationTests(unittest.TestCase):
         )
         self.assertEqual(paths.glb.name, "result.glb")
         self.assertEqual(paths.metrics.name, "metrics.json")
+        self.assertEqual(paths.projection_stats.name, "projection_stats.json")
 
     def test_mode_setter_updates_only_naf_models(self):
         ss = _FakeCond(False)
@@ -122,6 +127,142 @@ class ProjectionFeatureAblationTests(unittest.TestCase):
         self.assertEqual(spec, ConditioningModeSpec("zero_both", True, False))
         self.assertEqual([stage.modes for stage in stages], [["zero_both"]] * 3)
         self.assertEqual(pipeline.switches, (True, False))
+
+    def test_pipeline_conditioning_masks_global_and_dense_ss_independently(self):
+        pipeline = Pixal3DImageTo3DPipeline()
+        z_global = torch.tensor([[[1.0, 2.0]]])
+        z_proj = torch.tensor([[[3.0, 4.0]]])
+
+        pipeline.set_conditioning_ablation(
+            global_enabled=False,
+            ss_projection_enabled=True,
+        )
+        global_off, projection_on = pipeline._apply_conditioning_ablation(
+            z_global,
+            z_proj,
+            stage="sparse_structure",
+        )
+        torch.testing.assert_close(global_off, torch.zeros_like(z_global))
+        torch.testing.assert_close(projection_on, z_proj)
+
+        pipeline.set_conditioning_ablation(
+            global_enabled=True,
+            ss_projection_enabled=False,
+        )
+        global_on, projection_off = pipeline._apply_conditioning_ablation(
+            z_global,
+            z_proj,
+            stage="sparse_structure",
+        )
+        torch.testing.assert_close(global_on, z_global)
+        torch.testing.assert_close(projection_off, torch.zeros_like(z_proj))
+        self.assertTrue(
+            pipeline.last_conditioning_mask_stats["sparse_structure"][
+                "projection_exact_zero"
+            ]
+        )
+
+    def test_pipeline_conditioning_mask_preserves_sparse_projection_coords(self):
+        pipeline = Pixal3DImageTo3DPipeline()
+        coords = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
+        projection = SparseTensor(
+            feats=torch.tensor([[2.0, 4.0]]),
+            coords=coords,
+        )
+        global_condition = torch.tensor([[[1.0, 3.0]]])
+        pipeline.set_conditioning_ablation(
+            global_enabled=False,
+            ss_projection_enabled=False,
+        )
+
+        masked_global, masked_projection = (
+            pipeline._apply_conditioning_ablation(
+                global_condition,
+                projection,
+                stage="sparse_structure",
+            )
+        )
+
+        torch.testing.assert_close(
+            masked_global,
+            torch.zeros_like(global_condition),
+        )
+        self.assertTrue(torch.equal(masked_projection.coords, coords))
+        torch.testing.assert_close(
+            masked_projection.feats,
+            torch.zeros_like(projection.feats),
+        )
+
+    def test_shape_conditioning_does_not_use_ss_projection_switch(self):
+        pipeline = Pixal3DImageTo3DPipeline()
+        z_global = torch.tensor([[[1.0, 2.0]]])
+        z_proj = torch.tensor([[[3.0, 4.0]]])
+        pipeline.set_conditioning_ablation(
+            global_enabled=True,
+            ss_projection_enabled=False,
+        )
+
+        actual_global, actual_projection = (
+            pipeline._apply_conditioning_ablation(
+                z_global,
+                z_proj,
+                stage="shape_512",
+            )
+        )
+
+        torch.testing.assert_close(actual_global, z_global)
+        torch.testing.assert_close(actual_projection, z_proj)
+
+    def test_projection_contribution_recorder_keeps_first_call_and_removes_hooks(
+        self,
+    ):
+        class CrossAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj_linear = nn.Linear(4, 3)
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cross_attn = CrossAttention()
+
+        class Flow(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([Block(), Block()])
+
+        flow = Flow()
+        with torch.no_grad():
+            for block in flow.blocks:
+                block.cross_attn.proj_linear.weight.fill_(0.5)
+                block.cross_attn.proj_linear.bias.fill_(0.25)
+        pipeline = SimpleNamespace(
+            models={"shape_slat_flow_model_512": flow},
+        )
+        recorder = ProjectionContributionRecorder(pipeline)
+        recorder.start()
+        first = torch.tensor([[1.0, 2.0, 0.0, 0.0]])
+        second = torch.full((1, 4), 10.0)
+        for block in flow.blocks:
+            block.cross_attn.proj_linear(first)
+            block.cross_attn.proj_linear(second)
+
+        stats = recorder.finish()
+        recorder.close()
+
+        blocks = stats["shape_512"]["blocks"]
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["calls_observed"], 2)
+        self.assertAlmostEqual(blocks[0]["bias_l2"], 3**0.5 * 0.25)
+        self.assertAlmostEqual(
+            blocks[0]["output_minus_bias_mean_token_l2"],
+            3**0.5 * 1.5,
+            places=6,
+        )
+        self.assertIn("low_weight_frobenius", blocks[0])
+        self.assertIn("high_weight_frobenius", blocks[0])
+        for block in flow.blocks:
+            self.assertEqual(len(block.cross_attn.proj_linear._forward_hooks), 0)
 
     def test_manifest_requires_entry_and_all_artifacts_to_resume(self):
         with tempfile.TemporaryDirectory() as tmpdir:

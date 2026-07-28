@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import torch
+from torch import nn
 from PIL import Image, ImageDraw, ImageOps
 from skimage.metrics import structural_similarity
 import trimesh
@@ -59,6 +61,114 @@ CAUSAL_MODE_SPECS = {
     "unconditional_e2e": ConditioningModeSpec("zero_both", False, False),
 }
 _RUN_MODES = tuple(dict.fromkeys((*_PROJ_FEATURE_MODES, *CAUSAL_MODE_SPECS)))
+_FLOW_MODEL_STAGES = {
+    "sparse_structure_flow_model": "sparse_structure",
+    "shape_slat_flow_model_512": "shape_512",
+    "shape_slat_flow_model_1024": "shape_1024",
+    "tex_slat_flow_model_1024": "tex_1024",
+}
+
+
+class ProjectionContributionRecorder:
+    """Record the first projection-linear activation without retaining tensors."""
+
+    def __init__(self, pipeline: Any):
+        self.pipeline = pipeline
+        self._handles = []
+        self._records: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def start(self) -> None:
+        if self._handles:
+            raise RuntimeError("ProjectionContributionRecorder is already active")
+        models = getattr(self.pipeline, "models", {})
+        for model_key, stage in _FLOW_MODEL_STAGES.items():
+            model = models.get(model_key)
+            if not isinstance(model, nn.Module):
+                continue
+            stage_records = self._records.setdefault(stage, {})
+            for module_name, module in model.named_modules():
+                if not (
+                    module_name.endswith("cross_attn.proj_linear")
+                    and isinstance(module, nn.Linear)
+                ):
+                    continue
+                record = self._static_record(stage, module_name, module)
+                stage_records[module_name] = record
+                self._handles.append(
+                    module.register_forward_hook(
+                        self._make_hook(record),
+                    )
+                )
+
+    @staticmethod
+    def _static_record(
+        stage: str,
+        module_name: str,
+        module: nn.Linear,
+    ) -> dict[str, Any]:
+        weight = module.weight.detach().float()
+        bias = module.bias
+        record = {
+            "name": module_name,
+            "calls_observed": 0,
+            "input_channels": int(module.in_features),
+            "output_channels": int(module.out_features),
+            "weight_frobenius": float(torch.linalg.vector_norm(weight).item()),
+            "bias_l2": (
+                0.0
+                if bias is None
+                else float(torch.linalg.vector_norm(bias.detach().float()).item())
+            ),
+        }
+        if stage != "sparse_structure" and module.in_features % 2 == 0:
+            half = module.in_features // 2
+            low_norm = torch.linalg.vector_norm(weight[:, :half]).item()
+            high_norm = torch.linalg.vector_norm(weight[:, half:]).item()
+            record.update(
+                {
+                    "low_weight_frobenius": float(low_norm),
+                    "high_weight_frobenius": float(high_norm),
+                    "low_to_high_weight_ratio": (
+                        None if high_norm == 0 else float(low_norm / high_norm)
+                    ),
+                }
+            )
+        return record
+
+    @staticmethod
+    def _make_hook(record: dict[str, Any]):
+        def hook(module: nn.Linear, inputs: tuple[Any, ...], output: torch.Tensor):
+            record["calls_observed"] += 1
+            if "output_mean_token_l2" in record:
+                return
+            value = output.detach().float()
+            record["output_mean_token_l2"] = float(
+                torch.linalg.vector_norm(value, dim=-1).mean().item()
+            )
+            if module.bias is None:
+                without_bias = value
+            else:
+                without_bias = value - module.bias.detach().float()
+            record["output_minus_bias_mean_token_l2"] = float(
+                torch.linalg.vector_norm(without_bias, dim=-1).mean().item()
+            )
+
+        return hook
+
+    def finish(self) -> dict[str, Any]:
+        result = {}
+        for stage, records in self._records.items():
+            blocks = list(records.values())
+            result[stage] = {
+                "blocks": [dict(record) for record in blocks],
+                "block_count": len(blocks),
+            }
+        return result
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
 
 
 @dataclass(frozen=True)
@@ -69,6 +179,7 @@ class RunPaths:
     turntable_dir: Path
     metrics: Path
     feature_stats: Path
+    projection_stats: Path
 
 
 def run_paths(root: Path, phase: str, image: Path, seed: int, mode: str) -> RunPaths:
@@ -84,6 +195,7 @@ def run_paths(root: Path, phase: str, image: Path, seed: int, mode: str) -> RunP
         turntable_dir=directory / "turntable",
         metrics=directory / "metrics.json",
         feature_stats=directory / "feature_stats.json",
+        projection_stats=directory / "projection_stats.json",
     )
 
 

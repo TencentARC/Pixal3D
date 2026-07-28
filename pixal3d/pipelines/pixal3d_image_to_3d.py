@@ -119,6 +119,67 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         }
         self._device = 'cpu'
 
+    def set_conditioning_ablation(
+        self,
+        *,
+        global_enabled: bool,
+        ss_projection_enabled: bool,
+    ) -> None:
+        """Configure inference-only image-conditioning masks."""
+        if not isinstance(global_enabled, bool):
+            raise TypeError("global_enabled must be a bool")
+        if not isinstance(ss_projection_enabled, bool):
+            raise TypeError("ss_projection_enabled must be a bool")
+        self._ablation_global_enabled = global_enabled
+        self._ablation_ss_projection_enabled = ss_projection_enabled
+        self.last_conditioning_mask_stats = {}
+
+    def _apply_conditioning_ablation(
+        self,
+        z_global: torch.Tensor,
+        z_proj: Union[torch.Tensor, SparseTensor],
+        *,
+        stage: str,
+    ) -> Tuple[torch.Tensor, Union[torch.Tensor, SparseTensor]]:
+        """Apply global and sparse-structure projection masks."""
+        global_enabled = getattr(self, "_ablation_global_enabled", True)
+        ss_projection_enabled = getattr(
+            self,
+            "_ablation_ss_projection_enabled",
+            True,
+        )
+        if not global_enabled:
+            z_global = torch.zeros_like(z_global)
+
+        projection_enabled = (
+            ss_projection_enabled if stage == "sparse_structure" else True
+        )
+        if not projection_enabled:
+            if isinstance(z_proj, SparseTensor):
+                z_proj = z_proj.replace(torch.zeros_like(z_proj.feats))
+            else:
+                z_proj = torch.zeros_like(z_proj)
+
+        proj_feats = z_proj.feats if isinstance(z_proj, SparseTensor) else z_proj
+        stats = getattr(self, "last_conditioning_mask_stats", None)
+        if stats is None:
+            stats = {}
+            self.last_conditioning_mask_stats = stats
+        stats[stage] = {
+            "global_enabled": global_enabled,
+            "ss_projection_enabled": ss_projection_enabled,
+            "projection_enabled": projection_enabled,
+            "global_exact_zero": bool(torch.count_nonzero(z_global).item() == 0),
+            "projection_exact_zero": bool(
+                torch.count_nonzero(proj_feats).item() == 0
+            ),
+            "global_tokens": int(z_global.shape[-2]),
+            "global_channels": int(z_global.shape[-1]),
+            "projection_tokens": int(proj_feats.shape[-2]),
+            "projection_channels": int(proj_feats.shape[-1]),
+        }
+        return z_global, z_proj
+
     @classmethod
     def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Pixal3DImageTo3DPipeline":
         """
@@ -288,6 +349,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         z_global, z_proj = image_cond_model(
             image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
         )
+        z_global, z_proj = self._apply_conditioning_ablation(
+            z_global,
+            z_proj,
+            stage="sparse_structure",
+        )
         if self.low_vram:
             image_cond_model.cpu()
         return {
@@ -348,6 +414,19 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         z_coords = coords[:, 3].long()
         z_proj_sparse = z_proj_grid[batch_indices, x_coords, y_coords, z_coords]
         z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
+        if image_cond_model is self.image_cond_model_shape_512:
+            stage = "shape_512"
+        elif image_cond_model is self.image_cond_model_shape_1024:
+            stage = "shape_1024"
+        elif image_cond_model is self.image_cond_model_tex_1024:
+            stage = "tex_1024"
+        else:
+            stage = "shape_or_texture"
+        z_global, z_proj_st = self._apply_conditioning_ablation(
+            z_global,
+            z_proj_st,
+            stage=stage,
+        )
 
         if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
             image_cond_model.grid_resolution = orig_grid_res

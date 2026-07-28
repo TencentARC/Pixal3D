@@ -14,6 +14,7 @@ from PIL import Image
 import run_projection_feature_ablation as runner
 from pixal3d.pipelines.pixal3d_image_to_3d import Pixal3DImageTo3DPipeline
 from pixal3d.utils.projection_feature_ablation import PILOT_IMAGES
+from pixal3d.utils.projection_feature_ablation import CAUSAL_MODE_SPECS
 
 
 MODES = ("concat", "low_only", "high_only")
@@ -146,6 +147,13 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
         self.assertEqual(main.seeds, [42, 43, 44])
         self.assertEqual(len(main.images), 19)
         self.assertEqual(main.images, sorted(main.images))
+
+    def test_causal_phase_defaults_to_nine_modes_six_images_and_seed_42(self):
+        causal = runner.parse_args(["--phase", "causal_seed42"])
+        self.assertEqual(causal.phase, "causal_seed42")
+        self.assertEqual(causal.images, list(PILOT_IMAGES))
+        self.assertEqual(causal.seeds, [42])
+        self.assertEqual(causal.modes, list(CAUSAL_MODE_SPECS))
 
     def test_main_default_rejects_changed_asset_matrix_but_explicit_images_bypass_it(
         self,
@@ -499,6 +507,7 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                     "empty_cache",
                 ],
             )
+
             manual_seed.assert_called_once_with(42)
             cuda_manual_seed.assert_called_once_with(42)
             run_kwargs = pipeline.run.call_args.kwargs
@@ -576,6 +585,104 @@ class ProjectionFeatureAblationCliTests(unittest.TestCase):
                 np.asarray(Image.open(paths.conditioning_render)),
                 np.asarray(prepared.rgb),
             )
+
+    def test_causal_generation_closes_projection_recorder_when_pipeline_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_path = root / "source.png"
+            Image.new("RGB", (8, 8)).save(image_path)
+            args = runner.parse_args(
+                [
+                    "--phase",
+                    "causal_seed42",
+                    "--images",
+                    str(image_path),
+                    "--output_root",
+                    str(root / "outputs"),
+                    "--render_resolution",
+                    "32",
+                ]
+            )
+            pipeline = SimpleNamespace(
+                run=Mock(side_effect=RuntimeError("pipeline failed")),
+            )
+            prepared = runner.PreparedInput(
+                image_path=image_path,
+                image_sha256="abc",
+                rgb=Image.new("RGB", (8, 8)),
+                mask=Image.new("L", (8, 8), 255),
+                camera_params={
+                    "camera_angle_x": 0.8,
+                    "distance": 2.0,
+                    "mesh_scale": 1.0,
+                },
+            )
+            paths = runner.run_paths(
+                Path(args.output_root),
+                args.phase,
+                image_path,
+                42,
+                "global_only_e2e",
+            )
+            recorder = Mock()
+            with (
+                patch.object(runner, "set_pipeline_conditioning_mode") as setter,
+                patch.object(
+                    runner,
+                    "ProjectionContributionRecorder",
+                    return_value=recorder,
+                ),
+                self.assertRaisesRegex(RuntimeError, "pipeline failed"),
+            ):
+                runner.generate_condition(
+                    pipeline,
+                    prepared,
+                    42,
+                    "global_only_e2e",
+                    paths,
+                    args,
+                )
+
+            setter.assert_called_once_with(pipeline, "global_only_e2e")
+            recorder.start.assert_called_once_with()
+            recorder.close.assert_called_once_with()
+
+    def test_causal_required_artifacts_and_mapping_include_projection_stats(self):
+        paths = runner.run_paths(
+            Path("outputs"),
+            "causal_seed42",
+            Path("assets/images/0_img.png"),
+            42,
+            "concat",
+        )
+
+        required = runner._required_artifacts(
+            paths,
+            8,
+            phase="causal_seed42",
+        )
+        artifacts = runner._artifact_mapping(
+            paths,
+            8,
+            phase="causal_seed42",
+        )
+
+        self.assertIn(paths.projection_stats, required)
+        self.assertEqual(
+            artifacts["projection_stats"],
+            str(paths.projection_stats),
+        )
+
+    def test_causal_manifest_is_phase_local(self):
+        root = Path("outputs/projection_feature_ablation")
+        self.assertEqual(
+            runner._manifest_path(root, "causal_seed42"),
+            root / "causal_seed42" / "manifest.json",
+        )
+        self.assertEqual(
+            runner._manifest_path(root, "pilot"),
+            root / "manifest.json",
+        )
 
     def test_normal_vram_generate_condition_does_not_clear_cache_before_export(
         self,

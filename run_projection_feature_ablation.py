@@ -10,7 +10,7 @@ import os
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -27,14 +27,17 @@ from inference import (
     load_moge_model,
 )
 from pixal3d.utils.projection_feature_ablation import (
+    CAUSAL_MODE_SPECS,
     DEFAULT_MAIN_SEEDS,
     PILOT_IMAGES,
     ManifestStore,
+    ProjectionContributionRecorder,
     RunPaths,
     collect_pipeline_feature_stats,
     compute_conditioning_metrics,
     mesh_statistics,
     run_paths,
+    set_pipeline_conditioning_mode,
     set_pipeline_proj_feature_mode,
     write_experiment_report,
     write_mode_contact_sheet,
@@ -45,6 +48,8 @@ from pixal3d.utils.sparse_slat_ablation import create_lpips_model
 
 
 MODES = ("concat", "low_only", "high_only")
+CAUSAL_MODES = tuple(CAUSAL_MODE_SPECS)
+ALL_MODES = tuple(dict.fromkeys((*MODES, *CAUSAL_MODES)))
 MAIN_IMAGE_DIR = Path("assets/images")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 FOREST_HDRI_PATH = Path(__file__).resolve().parent / "assets" / "hdri" / "forest.exr"
@@ -65,10 +70,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run paired Pixal3D projection-feature ablations."
     )
-    parser.add_argument("--phase", choices=("pilot", "main"), required=True)
+    parser.add_argument(
+        "--phase",
+        choices=("pilot", "main", "causal_seed42"),
+        required=True,
+    )
     parser.add_argument("--images", nargs="+", metavar="PATH")
     parser.add_argument("--seeds", nargs="+", type=int, metavar="INT")
-    parser.add_argument("--modes", nargs="+", choices=MODES)
+    parser.add_argument("--modes", nargs="+", choices=ALL_MODES)
     parser.add_argument(
         "--output_root",
         default="outputs/projection_feature_ablation",
@@ -102,7 +111,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
     if args.images is None:
-        if args.phase == "pilot":
+        if args.phase in ("pilot", "causal_seed42"):
             args.images = list(PILOT_IMAGES)
         else:
             if not MAIN_IMAGE_DIR.is_dir():
@@ -118,12 +127,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                     f"{MAIN_IMAGE_DIR}; pass --images to override"
                 )
     if args.seeds is None:
-        args.seeds = [42] if args.phase == "pilot" else list(DEFAULT_MAIN_SEEDS)
+        args.seeds = (
+            [42]
+            if args.phase in ("pilot", "causal_seed42")
+            else list(DEFAULT_MAIN_SEEDS)
+        )
+    default_modes = CAUSAL_MODES if args.phase == "causal_seed42" else MODES
     if args.modes is None:
-        args.modes = list(MODES)
+        args.modes = list(default_modes)
     else:
         requested_modes = set(args.modes)
-        args.modes = [mode for mode in MODES if mode in requested_modes]
+        args.modes = [mode for mode in default_modes if mode in requested_modes]
     if args.turntable_frames != 8:
         parser.error("--turntable_frames must be 8 for the fixed experiment")
     return args
@@ -243,7 +257,14 @@ def generate_condition(
     started_at = time.perf_counter()
     paths.directory.mkdir(parents=True, exist_ok=True)
     paths.turntable_dir.mkdir(parents=True, exist_ok=True)
-    set_pipeline_proj_feature_mode(pipeline, mode)
+    recorder = None
+    condition_spec = None
+    if args.phase == "causal_seed42":
+        condition_spec = set_pipeline_conditioning_mode(pipeline, mode)
+        recorder = ProjectionContributionRecorder(pipeline)
+        recorder.start()
+    else:
+        set_pipeline_proj_feature_mode(pipeline, mode)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -265,21 +286,33 @@ def generate_condition(
         "guidance_rescale": 0.0,
         "rescale_t": 3.0,
     }
-    mesh_list, (_, _, resolution) = pipeline.run(
-        prepared.rgb,
-        camera_params=prepared.camera_params,
-        seed=seed,
-        sparse_structure_sampler_params=sparse_structure_sampler_params,
-        shape_slat_sampler_params=shape_slat_sampler_params,
-        tex_slat_sampler_params=tex_slat_sampler_params,
-        preprocess_image=False,
-        return_latent=True,
-        pipeline_type=args.pipeline_type,
-        max_num_tokens=args.max_num_tokens,
-    )
+    try:
+        mesh_list, (_, _, resolution) = pipeline.run(
+            prepared.rgb,
+            camera_params=prepared.camera_params,
+            seed=seed,
+            sparse_structure_sampler_params=sparse_structure_sampler_params,
+            shape_slat_sampler_params=shape_slat_sampler_params,
+            tex_slat_sampler_params=tex_slat_sampler_params,
+            preprocess_image=False,
+            return_latent=True,
+            pipeline_type=args.pipeline_type,
+            max_num_tokens=args.max_num_tokens,
+        )
+        projection_stats = {} if recorder is None else recorder.finish()
+    finally:
+        if recorder is not None:
+            recorder.close()
     mesh = mesh_list[0]
     feature_stats = collect_pipeline_feature_stats(pipeline)
+    if condition_spec is not None:
+        feature_stats["conditioning_mode"] = asdict(condition_spec)
+        feature_stats["conditioning_masks"] = dict(
+            getattr(pipeline, "last_conditioning_mask_stats", {})
+        )
     _atomic_write_json(paths.feature_stats, feature_stats)
+    if args.phase == "causal_seed42":
+        _atomic_write_json(paths.projection_stats, projection_stats)
     geometry_metrics = mesh_statistics(mesh.vertices, mesh.faces)
 
     if args.low_vram:
@@ -375,6 +408,7 @@ def generate_condition(
     return {
         "metrics": metrics,
         "feature_stats": feature_stats,
+        "projection_stats": projection_stats,
         "elapsed_seconds": elapsed_seconds,
     }
 
@@ -444,8 +478,13 @@ def _atomic_write_json(path: Path, value: Any) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _required_artifacts(paths: RunPaths, frame_count: int) -> list[Path]:
-    return [
+def _required_artifacts(
+    paths: RunPaths,
+    frame_count: int,
+    *,
+    phase: str | None = None,
+) -> list[Path]:
+    required = [
         paths.glb,
         paths.conditioning_render,
         *[
@@ -455,6 +494,9 @@ def _required_artifacts(paths: RunPaths, frame_count: int) -> list[Path]:
         paths.metrics,
         paths.feature_stats,
     ]
+    if phase == "causal_seed42":
+        required.append(paths.projection_stats)
+    return required
 
 
 def _run_id(
@@ -466,7 +508,12 @@ def _run_id(
     return f"{phase}:{image_path.resolve()}:{seed}:{mode}"
 
 
-def _artifact_mapping(paths: RunPaths, frame_count: int) -> dict[str, Any]:
+def _artifact_mapping(
+    paths: RunPaths,
+    frame_count: int,
+    *,
+    phase: str | None = None,
+) -> dict[str, Any]:
     artifacts = {
         "result_glb": str(paths.glb),
         "conditioning_render": str(paths.conditioning_render),
@@ -477,7 +524,15 @@ def _artifact_mapping(paths: RunPaths, frame_count: int) -> dict[str, Any]:
         str(paths.turntable_dir / f"{frame_index:02d}.png")
         for frame_index in range(frame_count)
     ]
+    if phase == "causal_seed42":
+        artifacts["projection_stats"] = str(paths.projection_stats)
     return artifacts
+
+
+def _manifest_path(output_root: Path, phase: str) -> Path:
+    if phase == "causal_seed42":
+        return output_root / phase / "manifest.json"
+    return output_root / "manifest.json"
 
 
 def _save_prepared_input(
@@ -540,6 +595,11 @@ def _manifest_rows(
             row["feature_stats"] = json.loads(
                 feature_stats_path.read_text(encoding="utf-8")
             )
+            projection_stats_path = artifacts.get("projection_stats")
+            if projection_stats_path is not None:
+                row["projection_stats"] = json.loads(
+                    Path(projection_stats_path).read_text(encoding="utf-8")
+                )
         rows.append(row)
     return rows
 
@@ -568,6 +628,8 @@ def _run_metadata(
         "git_commit": git_commit,
         "dirty_worktree": dirty_worktree,
     }
+    if args.phase == "causal_seed42":
+        metadata["conditioning_mode"] = asdict(CAUSAL_MODE_SPECS[mode])
     metadata["resume_fingerprint"] = _resume_fingerprint(metadata)
     return metadata
 
@@ -666,7 +728,7 @@ def run_matrix(
         moge_model = load_moge_model(device=args.device)
 
     output_root = Path(args.output_root)
-    manifest_path = output_root / "manifest.json"
+    manifest_path = _manifest_path(output_root, args.phase)
     manifest = ManifestStore(manifest_path)
     requested_run_ids: list[str] = []
     stopped = False
@@ -726,7 +788,11 @@ def run_matrix(
                 paths = run_paths(output_root, args.phase, image_path, seed, mode)
                 run_id = _run_id(args.phase, image_path, seed, mode)
                 requested_run_ids.append(run_id)
-                required = _required_artifacts(paths, args.turntable_frames)
+                required = _required_artifacts(
+                    paths,
+                    args.turntable_frames,
+                    phase=args.phase,
+                )
                 if manifest.is_complete(run_id, required):
                     continue
                 metadata = _run_metadata(
@@ -765,7 +831,11 @@ def run_matrix(
                     )
                     manifest.complete(
                         run_id,
-                        _artifact_mapping(paths, args.turntable_frames),
+                        _artifact_mapping(
+                            paths,
+                            args.turntable_frames,
+                            phase=args.phase,
+                        ),
                     )
                 except Exception as error:
                     manifest.fail(run_id, error)
@@ -787,6 +857,7 @@ def run_matrix(
                     _required_artifacts(
                         mode_paths[mode],
                         args.turntable_frames,
+                        phase=args.phase,
                     ),
                 )
                 for mode in MODES
