@@ -89,6 +89,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", metavar="CUDA_DEVICE")
     parser.add_argument("--low_vram", action="store_true")
     parser.add_argument(
+        "--geometry_only_export",
+        action="store_true",
+        help="Skip CuMesh and export a CPU geometry-only GLB.",
+    )
+    parser.add_argument(
         "--allow_mixed_revision_resume",
         action="store_true",
         help=(
@@ -354,34 +359,7 @@ def generate_condition(
     )
     glb = None
     export_fallback = None
-    try:
-        glb = o_voxel.postprocess.to_glb(
-            vertices=mesh.vertices,
-            faces=mesh.faces,
-            attr_volume=mesh.attrs,
-            coords=mesh.coords,
-            attr_layout=pipeline.pbr_attr_layout,
-            grid_size=resolution,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target=args.decimation_target,
-            texture_size=args.texture_size,
-            remesh=True,
-            remesh_band=1,
-            remesh_project=0,
-            use_tqdm=True,
-        )
-        glb.apply_transform(rotation)
-        try:
-            glb.export(paths.glb, extension_webp=True)
-        except AttributeError as error:
-            if "_webp" not in str(error):
-                raise
-            glb.export(paths.glb, extension_webp=False)
-    except RuntimeError as error:
-        if not _is_cumesh_out_of_memory(error):
-            raise
-        gc.collect()
-        torch.cuda.empty_cache()
+    if args.geometry_only_export:
         export_fallback = _export_geometry_only_glb(
             mesh,
             paths.glb,
@@ -389,9 +367,48 @@ def generate_condition(
             face_target=args.decimation_target,
         )
         print(
-            "[Ablation] CuMesh OOM; exported geometry-only GLB fallback "
+            "[Ablation] Explicit geometry-only GLB export "
             f"({export_fallback['faces']} faces)"
         )
+    else:
+        try:
+            glb = o_voxel.postprocess.to_glb(
+                vertices=mesh.vertices,
+                faces=mesh.faces,
+                attr_volume=mesh.attrs,
+                coords=mesh.coords,
+                attr_layout=pipeline.pbr_attr_layout,
+                grid_size=resolution,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target=args.decimation_target,
+                texture_size=args.texture_size,
+                remesh=True,
+                remesh_band=1,
+                remesh_project=0,
+                use_tqdm=True,
+            )
+            glb.apply_transform(rotation)
+            try:
+                glb.export(paths.glb, extension_webp=True)
+            except AttributeError as error:
+                if "_webp" not in str(error):
+                    raise
+                glb.export(paths.glb, extension_webp=False)
+        except RuntimeError as error:
+            if not _is_cumesh_out_of_memory(error):
+                raise
+            gc.collect()
+            torch.cuda.empty_cache()
+            export_fallback = _export_geometry_only_glb(
+                mesh,
+                paths.glb,
+                rotation,
+                face_target=args.decimation_target,
+            )
+            print(
+                "[Ablation] CuMesh OOM; exported geometry-only GLB fallback "
+                f"({export_fallback['faces']} faces)"
+            )
 
     simplify = getattr(mesh, "simplify", None)
     if callable(simplify):
@@ -1174,6 +1191,7 @@ def _pipeline_settings(
         "turntable_frames": args.turntable_frames,
         "decimation_target": args.decimation_target,
         "texture_size": args.texture_size,
+        "geometry_only_export": args.geometry_only_export,
         "samplers": {
             "sparse_structure": {
                 "steps": 12,
