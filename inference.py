@@ -71,9 +71,9 @@ def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     return moge_model
 
 
-def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
+def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False, rembg_model_name=...):
     print(f"[Pipeline] Loading from {model_path}...")
-    pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
+    pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path, rembg_model_name=rembg_model_name)
 
     print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
     pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
@@ -182,9 +182,10 @@ def run_inference(
     manual_fov: float = -1.0,
     low_vram: bool = False,
     resolution: int = -1,
+    rembg_model_name = ...,
 ):
     # Load models
-    pipeline = init_pipeline(model_path, low_vram=low_vram)
+    pipeline = init_pipeline(model_path, low_vram=low_vram, rembg_model_name=rembg_model_name)
 
     # Preprocess image first — rembg loads to GPU for this call, then offloads.
     # MoGe is loaded afterwards so both never occupy VRAM at the same time.
@@ -298,8 +299,24 @@ if __name__ == "__main__":
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
     parser.add_argument("--resolution", type=int, default=-1,
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
+    parser.add_argument("--no_rembg", action="store_true",
+                        help="Skip background removal entirely. "
+                             "Works best with images that already have an alpha channel (e.g. pre-masked PNGs). "
+                             "For plain RGB images the full frame is treated as foreground.")
+    parser.add_argument("--rembg_model", type=str, default=None,
+                        help="Override the background-removal model loaded from the pipeline config. "
+                             "E.g. 'ZhengPeng7/BiRefNet' is an MIT-licensed drop-in replacement for "
+                             "the default 'briaai/RMBG-2.0' (which requires gated HuggingFace access). "
+                             "Ignored when --no_rembg is set.")
 
     args = parser.parse_args()
+
+    if args.no_rembg:
+        rembg_model_name = None
+    elif args.rembg_model:
+        rembg_model_name = args.rembg_model
+    else:
+        rembg_model_name = ...
 
     run_inference(
         image_path=args.image,
@@ -309,4 +326,5 @@ if __name__ == "__main__":
         model_path=args.model_path,
         low_vram=args.low_vram,
         resolution=args.resolution,
+        rembg_model_name=rembg_model_name,
     )

@@ -92,12 +92,19 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         self._device = 'cpu'
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Pixal3DImageTo3DPipeline":
+    def from_pretrained(cls, path: str, config_file: str = "pipeline.json", rembg_model_name = ...) -> "Pixal3DImageTo3DPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
+            rembg_model_name: Override the HuggingFace model name used for background removal.
+                Use a string such as "ZhengPeng7/BiRefNet" (MIT-licensed) to replace the default
+                gated model from the pipeline config.
+                Pass None to skip loading any background removal model; images with an existing
+                alpha channel will still be handled correctly, and images without one will have
+                their full content treated as foreground.
+                Defaults to ... (Ellipsis), which means "use whatever the pipeline config says".
         """
         pipeline = super().from_pretrained(path, config_file)
         args = pipeline._pretrained_args
@@ -120,7 +127,13 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         pipeline.image_cond_model_shape_1024 = None
         pipeline.image_cond_model_tex_1024 = None
 
-        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
+        if rembg_model_name is None:
+            pipeline.rembg_model = None
+        else:
+            rembg_args = args['rembg_model']['args'].copy()
+            if rembg_model_name is not ...:
+                rembg_args['model_name'] = rembg_model_name
+            pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**rembg_args)
         
         pipeline.low_vram = args.get('low_vram', True)
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
@@ -161,6 +174,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
         if has_alpha:
             output = input
+        elif self.rembg_model is None:
+            output = input.convert('RGBA')
         else:
             input = input.convert('RGB')
             if self.low_vram:
