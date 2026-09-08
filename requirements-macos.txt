@@ -1,0 +1,3 @@
+# CUDA-free additions required by the Apple/Metal o_voxel postprocess path.
+xatlas
+fast-simplification
