@@ -26,8 +26,8 @@ class DinoV2FeatureExtractor:
     def to(self, device):
         self.model.to(device)
 
-    def cuda(self):
-        self.model.to(self.device)
+    def cuda(self, device=None):
+        self.model.cuda(device=device)
 
     def cpu(self):
         self.model.cpu()
@@ -80,8 +80,8 @@ class DinoV3FeatureExtractor:
     def to(self, device):
         self.model.to(device)
 
-    def cuda(self):
-        self.model.to(self.device)
+    def cuda(self, device=None):
+        self.model.cuda(device=device)
 
     def cpu(self):
         self.model.cpu()

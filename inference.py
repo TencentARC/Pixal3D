@@ -7,13 +7,6 @@ import cv2
 from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-os.environ.setdefault("ATTN_BACKEND", "sdpa")
-# PyTorch's MPS SDPA remains substantially faster for Pixal3D's ~40k-token
-# HR sequences.  The validated flex_gemm kernel stays available as an opt-in
-# backend, but regresses badly once attention becomes this long.
-os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
-os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 
 from macos_compat import configure
@@ -21,14 +14,13 @@ from macos_compat import configure
 DEVICE = configure()
 import torch
 
-from backends.cuda_parity_export import to_glb_cuda_parity
+from backends.export import export_glb, resolve_export_profile
 from backends.decoded_checkpoint import (
     load_decoded_checkpoint,
     save_decoded_checkpoint,
 )
 from backends.memory import release_accelerator_memory
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
-from o_voxel import postprocess_cpu
 
 # ============================================================================
 # Constants & Defaults
@@ -85,13 +77,15 @@ def load_moge_model(device=DEVICE, model_name=MOGE_MODEL_NAME):
     return moge_model
 
 
-def init_pipeline(model_path=MODEL_PATH, device=DEVICE, low_vram=True):
+def init_pipeline(model_path=MODEL_PATH, device=DEVICE, low_vram=None):
+    if low_vram is None:
+        low_vram = torch.device(device).type == "mps"
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
     print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
     pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
-    shared_dino = pipeline.image_cond_model_ss.model
+    shared_dino = pipeline.image_cond_model_ss.model if torch.device(device).type == "mps" else None
     pipeline.image_cond_model_shape_512 = build_image_cond_model(
         IMAGE_COND_CONFIGS["shape_512"], shared_model=shared_dino
     )
@@ -111,7 +105,7 @@ def init_pipeline(model_path=MODEL_PATH, device=DEVICE, low_vram=True):
                      'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
             m = getattr(pipeline, attr, None)
             if m is not None and getattr(m, 'use_naf_upsample', False):
-                if shared_naf is None:
+                if shared_naf is None or torch.device(device).type != "mps":
                     m._load_naf()
                     shared_naf = m.naf_model
                 else:
@@ -133,7 +127,7 @@ def init_pipeline(model_path=MODEL_PATH, device=DEVICE, low_vram=True):
                      'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
             m = getattr(pipeline, attr, None)
             if m is not None and getattr(m, 'use_naf_upsample', False):
-                if shared_naf is None:
+                if shared_naf is None or torch.device(device).type != "mps":
                     m._load_naf()
                     shared_naf = m.naf_model
                 else:
@@ -211,11 +205,11 @@ def run_inference(
     max_num_tokens: int = 49152,
     model_path: str = MODEL_PATH,
     manual_fov: float = -1.0,
-    low_vram: bool = False,
+    low_vram: bool | None = None,
     resolution: int = -1,
     decimation_target: int | None = None,
     texture_size: int | None = None,
-    export_profile: str = "cuda-parity",
+    export_profile: str = "auto",
     decoded_checkpoint: str | None = None,
     checkpoint_output: str | None = None,
     save_decoded: bool | None = None,
@@ -224,11 +218,10 @@ def run_inference(
     source_face_chunk_size: int = 250_000,
     remesh_resolution: int | None = None,
 ):
-    if export_profile not in {"portable", "cuda-parity"}:
-        raise ValueError(
-            f"Unknown export profile {export_profile!r}; "
-            "expected 'portable' or 'cuda-parity'"
-        )
+    export_profile = resolve_export_profile(DEVICE, export_profile)
+    is_mps = torch.device(DEVICE).type == "mps"
+    if low_vram is None:
+        low_vram = is_mps
     if decoded_checkpoint is None and not image_path:
         raise ValueError("image_path is required unless decoded_checkpoint is used")
     if save_decoded is None:
@@ -359,8 +352,8 @@ def run_inference(
             return_latent=False,
             pipeline_type=pipeline_type,
             max_num_tokens=max_num_tokens,
-            release_models=True,
-            output_device="cpu",
+            release_models=is_mps,
+            output_device="cpu" if is_mps else None,
         )
         mesh = mesh_list[0]
         res = round(1 / float(mesh.voxel_size))
@@ -394,56 +387,24 @@ def run_inference(
 
     attr_layout = dict(mesh.layout)
     export_started = time.perf_counter()
-    if export_profile == "cuda-parity":
-        decimation_target = decimation_target or 1_000_000
-        texture_size = texture_size or 4096
-        effective_remesh_resolution = remesh_resolution or min(512, res)
-        print(
-            "[Export] CUDA-parity profile: "
-            f"remesh={effective_remesh_resolution}, "
-            f"faces={decimation_target:,}, texture={texture_size}², "
-            f"source BVH faces/chunk={source_face_chunk_size:,}, "
-            f"BVH chunks={bvh_chunk_size:,}, "
-            f"volume chunks={grid_chunk_size:,}."
-        )
-        glb = to_glb_cuda_parity(
-            vertices=mesh.vertices,
-            faces=mesh.faces,
-            attr_volume=mesh.attrs,
-            coords=mesh.coords,
-            attr_layout=attr_layout,
-            resolution=res,
-            decimation_target=decimation_target,
-            texture_size=texture_size,
-            bvh_chunk_size=bvh_chunk_size,
-            grid_chunk_size=grid_chunk_size,
-            source_face_chunk_size=source_face_chunk_size,
-            remesh_resolution=effective_remesh_resolution,
-            verbose=True,
-            use_tqdm=True,
-        )
-    else:
-        decimation_target = decimation_target or 50_000
-        texture_size = texture_size or 256
-        print(
-            "[Export] Portable profile: "
-            f"faces={decimation_target:,}, texture={texture_size}²."
-        )
-        glb = postprocess_cpu.to_glb(
-            vertices=mesh.vertices,
-            faces=mesh.faces,
-            attr_volume=mesh.attrs,
-            coords=mesh.coords,
-            attr_layout=attr_layout,
-            grid_size=res,
-            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target=decimation_target,
-            texture_size=texture_size,
-            remesh=False,
-            remesh_band=1,
-            remesh_project=0,
-            use_tqdm=True,
-        )
+    glb = export_glb(
+        vertices=mesh.vertices,
+        faces=mesh.faces,
+        attr_volume=mesh.attrs,
+        coords=mesh.coords,
+        attr_layout=attr_layout,
+        resolution=res,
+        device=DEVICE,
+        profile=export_profile,
+        decimation_target=decimation_target,
+        texture_size=texture_size,
+        bvh_chunk_size=bvh_chunk_size,
+        grid_chunk_size=grid_chunk_size,
+        source_face_chunk_size=source_face_chunk_size,
+        remesh_resolution=remesh_resolution,
+        verbose=True,
+        use_tqdm=True,
+    )
 
     # Apply rotation
     rot = np.array([
@@ -483,7 +444,7 @@ if __name__ == "__main__":
                              "If not set, FOV is auto-estimated via MoGe-2. "
                              "Try 0.2 rad if you notice distortion.")
     parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path or HuggingFace repo")
-    parser.add_argument("--low_vram", action="store_true", default=True,
+    parser.add_argument("--low_vram", action="store_true", default=DEVICE.startswith("mps"),
                         help="Enable low-VRAM mode: models stay on CPU and are loaded to GPU on-demand per stage. "
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
     parser.add_argument("--standard", action="store_false", dest="low_vram",
@@ -492,12 +453,12 @@ if __name__ == "__main__":
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
     parser.add_argument(
         "--export-profile",
-        choices=["cuda-parity", "portable"],
-        default="cuda-parity",
+        choices=["auto", "native", "cuda-parity", "portable"],
+        default="auto",
         help=(
-            "GLB profile. cuda-parity uses native Metal remeshing, one million "
-            "faces and 4096px textures; portable keeps the former lightweight "
-            "fallback."
+            "auto selects upstream native export on CUDA and cuda-parity on "
+            "MPS (one million faces / 4096px textures). portable explicitly "
+            "selects the lightweight fallback, when installed."
         ),
     )
     parser.add_argument(

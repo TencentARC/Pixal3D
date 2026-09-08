@@ -1,5 +1,4 @@
 from typing import *
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,15 +17,7 @@ from .sparse_unet_vae import (
     SparseUnetVaeDecoder,
 )
 from ...representations import Mesh
-# The Metal o_voxel converter is not reliable for decoder output on every
-# macOS/PyTorch combination. Prefer the portable implementation shipped in
-# backends/mesh_extract.py; the Metal postprocess module remains available for
-# textured GLB export.
-import sys as _sys
-_stubs = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'stubs')
-if _stubs not in _sys.path:
-    _sys.path.append(_stubs)
-from o_voxel_override_convert import flexible_dual_grid_to_mesh
+from backends.mesh_conversion import flexible_dual_grid_to_mesh
 
 
 class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):

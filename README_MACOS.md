@@ -1,11 +1,13 @@
-# Pixal3D sur macOS Apple Silicon
+# Pixal3D on macOS Apple Silicon
 
-Ce dépôt contient le code officiel Pixal3D et un port d’exécution MPS pour le
-Mac M3 Max 36 Go. Le port reprend les backends Metal validés dans
-`../trellis2-macos` : `mtldiffrast`, `mtlmesh`, `mtlgemm`, `mtlbvh` et le fork
-Apple de `o_voxel`.
+This experimental inference port has been validated on an M3 Max with 36 GB
+of unified memory. It builds on the Metal backends from the TRELLIS.2 Apple
+Silicon ecosystem: `mtldiffrast`, `mtlmesh`, `mtlgemm`, `mtlbvh` and the
+Apple fork of `o_voxel`. A sibling TRELLIS checkout is not required.
 
 ## Installation
+
+Install Xcode command-line tools and [uv](https://docs.astral.sh/uv/), then:
 
 ```bash
 xcodebuild -downloadComponent MetalToolchain
@@ -13,20 +15,45 @@ bash setup_macos.sh
 source .venv/bin/activate
 ```
 
-Les poids sont téléchargés à la demande par Hugging Face. Pour les mettre en
-cache avant le premier calcul :
+The setup script pins the Metal dependency revisions. Its patch step modifies
+only the installed third-party Metal `o_voxel`, not tracked Pixal3D sources.
+It refuses to patch a CUDA `o_voxel` installation.
+
+Weights are downloaded from Hugging Face on demand. To populate the cache:
 
 ```bash
 python scripts/download_models.py
 ```
 
-## Génération iso-qualité CUDA
+The macOS extras are listed in `requirements-macos.txt`. MoGe needs the newer
+`utils3d.pt` API, so the macOS setup uses the newer utils3d source rather than
+the older 0.0.2 wheel. `requirements-hfdemo.txt` is for the Hugging Face Space.
 
-Le profil `cuda-parity` conserve la cascade neurale 1536, le volume PBR
-1536, une cible d’environ un million de faces et les textures PBR 4096 px.
-Le dual-contouring utilise par défaut une grille 512³ : c’est le profil
-validé avec marge sur 36 Go, et son résultat passe les contrôles structuraux
-face au GLB CUDA de référence.
+## Device selection and CUDA compatibility
+
+Both entry points select CUDA when available, otherwise MPS, otherwise CPU.
+Override this before starting a new process, for example
+`PIXAL3D_DEVICE=cuda:1 python inference.py ...` or `PIXAL3D_DEVICE=mps ...`.
+An explicitly requested, unavailable accelerator raises an error.
+CPU is a fallback device, not a guarantee of a supported CPU-only pipeline.
+
+On CUDA, the runtime leaves PyTorch's CUDA methods intact, keeps upstream
+Flash Attention defaults and uses native CUDA dual-grid extraction and GLB
+export. Apple-only exporters are imported lazily, only when selected.
+Existing environment overrides are respected. CUDA installation still follows
+the main [README](README.md); do not run `setup_macos.sh` on Linux.
+
+On MPS, legacy CUDA calls are redirected within the process. The default is
+SDPA with `flex_gemm` sparse convolutions. The learned NAF upsampler is retained;
+only its CUDA-only NATTEN operation is replaced with row-chunked PyTorch
+attention. The fused Metal attention backend remains opt-in: it was slower
+than MPS SDPA on this workload's roughly 40,000-token sequences.
+
+Low-VRAM mode defaults to on for MPS and off for CUDA. Use `--low_vram` or
+`--standard` to override the CLI default. Unless `--resolution` is supplied,
+low-VRAM mode selects a 1024 cascade; standard mode selects 1536.
+
+## High-quality generation
 
 ```bash
 python inference.py \
@@ -34,85 +61,124 @@ python inference.py \
   --output output/0_cuda_parity.glb \
   --low_vram \
   --resolution 1536 \
-  --export-profile cuda-parity
+  --export-profile auto
 ```
 
-Avant l’export, le programme sauvegarde automatiquement
-`output/0_cuda_parity.decoded.pt`. Ce checkpoint contient le maillage décodé
-et son volume PBR sparse, sans les poids des modèles. Si le remeshing ou la
-texture 4096 échoue, l’export peut être repris sans relancer la génération :
+The export profiles are:
+
+| Profile | Behavior |
+| --- | --- |
+| `auto` (default) | Native upstream export on CUDA; `cuda-parity` on MPS; portable fallback on CPU if installed. |
+| `native` | CUDA only; upstream remeshing with a default one-million-face target and 4096px PBR textures. |
+| `cuda-parity` | MPS only; validated bounded Metal remeshing with a default one-million-face target and 4096px PBR textures. |
+| `portable` | Explicit lightweight fallback, if installed; defaults to 50,000 faces / 256px textures without remeshing. |
+
+`--decimation-target` and `--texture-size` override the export defaults;
+neither the CLI nor the interface silently clamps these values.
+
+On MPS, the example retains the 1536 neural cascade and sparse PBR volume.
+The intermediate dual-contouring grid defaults to 512³, the profile validated
+with headroom on 36 GB. This is **not** bitwise or algorithmic identity with
+CUDA. Higher `--remesh-resolution` values are experimental and may exceed
+available memory.
+
+### Resume export
+
+The Metal high-quality profile saves a decoded checkpoint before export.
+An export retry does not need to rerun neural generation:
 
 ```bash
 python inference.py \
-  --image assets/images/0_img.png \
   --decoded-checkpoint output/0_cuda_parity.decoded.pt \
-  --output output/0_cuda_parity.glb \
-  --export-profile cuda-parity
+  --output output/0_cuda_parity_retry.glb \
+  --export-profile auto
 ```
 
-`--remesh-resolution` permet d’expérimenter avec une grille plus dense, mais
-la mémoire du simplificateur croît rapidement au-delà de 512. Le profil
-historique léger reste accessible avec `--export-profile portable`.
+Use `--no-save-decoded` to disable automatic checkpoint saving.
+Checkpoint export on CUDA moves the stored CPU tensors to the selected CUDA
+device before calling the upstream exporter.
 
-La pression sur les 36 Go de mémoire unifiée est limitée de quatre façons :
+### Memory strategy
 
-- DINOv3 et NAF sont partagés entre les quatre conditionneurs ;
-- chaque flow/decoder est supprimé après sa dernière étape ;
-- le maillage et le volume décodés passent sur CPU avant l’export ;
-- le BVH source de 18 millions de triangles est réduit exactement sur des
-  hiérarchies successives de 250 000 faces ;
-- le remesh, le nettoyage/simplification et le bake sont des étapes séparées,
-  ce qui libère leurs allocations Metal entre elles ;
-- l’échantillonnage du volume est découpé en lots ;
-- seuls les sommets d’échantillonnage puis les rares texels invalides sont
-  reprojetés sur la surface source.
+- Share DINOv3 and NAF between conditioners on MPS.
+- Release one-shot flow/decoder models after their final use in the MPS CLI.
+- Move decoded tensors to CPU before Metal export.
+- Query source BVHs in successive 250,000-face chunks, reducing by global
+  minimum distance to avoid the large monolithic BVH accuracy failure.
+- Separate remeshing, cleanup/simplification and texture baking so temporary
+  Metal allocations can be released.
+- Batch sparse-volume sampling and reproject only texture-sampling vertices
+  and remaining invalid texels.
 
-La grille dual-contouring n’est volontairement pas tuilée : des blocs
-indépendants créeraient des raccords. C’est le BVH de distance qui est
-découpé, puis réduit par minimum global, donc sans fissure aux frontières.
+The dual-contouring grid itself is not tiled, avoiding seams between blocks.
 
-### Validation de référence
+## Local interface
 
-Le cas `output/inputs/0_img_2048.png`, seed 42, a été comparé au GLB produit
-par la branche `main` sur une RTX A5000 RunPod :
+```bash
+python app.py --low_vram
+```
 
-- CUDA : 937 343 faces, 5 arêtes de bord, 99,47 % dans la composante
-  principale, aire 5,197 ;
-- MPS final : 989 941 faces, 7 arêtes de bord, 99,46 % dans la composante
-  principale, aire 4,944 ;
-- les deux fichiers ont une texture 4096², un matériau opaque/simple face et
-  un alpha p01 de 254.
+The interface uses the same automatic export routing as the CLI: native CUDA
+or high-quality Metal, respecting the requested face count and 4096px textures.
+It no longer forces the old 50,000-face / 256px portable export.
 
-Le contrôle automatisé se relance avec :
+MPS requests are serialized because the Metal exporter patches process-global
+backend functions. Before exporting, the interface releases unneeded neural
+models, then the decoders. A subsequent neural request reloads the models.
+This trades reload latency for memory headroom; it does not change CUDA's
+persistent-model behavior. The UI's selected neural resolution still matters.
+
+## Validation and limitations
+
+The historical reference case (`output/inputs/0_img_2048.png`, seed 42) compared
+this Mac's high-quality output against **unmodified upstream CUDA** on an RTX
+A5000:
+
+| Measurement | CUDA reference | MPS reference |
+| --- | ---: | ---: |
+| Faces | 937,343 | 989,941 |
+| Boundary edges | 5 | 7 |
+| Dominant connected component | 99.47% | 99.46% |
+| Surface area | 5.197 | 4.944 |
+| PBR texture | 4096² | 4096² |
+| Material | Opaque, single-sided | Opaque, single-sided |
+
+The Blender comparison found no visible point-cloud/transparency artifact in
+the final MPS export. On that case, neural generation took 1,979.85 s and
+export 128.65 s (about 35 min 09 s total), versus about 13 min 25 s for CUDA.
+These are historical measurements, not a new benchmark of every revision or
+evidence of identical quality for all objects.
+
+Run the hardware-independent regression suite with:
+
+```bash
+uv pip install pytest
+python -m pytest -q tests
+```
+
+Routing tests simulate device availability and backend calls; entry-point tests
+isolate actual function definitions without downloading models. They cover
+CUDA API preservation, device overrides, native-vs-Metal mesh conversion and
+export, UI quality settings, MPS model teardown and request locking.
+
+Real MPS checks:
+
+```bash
+python -m scripts.smoke_cuda_parity_export
+python -m scripts.smoke_naf_mps --target-size 128 --feature-size 16
+python inference.py --help
+python app.py --help
+```
+
+The export smoke test uses a small synthetic mesh, a 32³ grid and 128px texture.
+It is not a full-resolution quality benchmark. **This revised branch still
+needs an end-to-end NVIDIA run**; the older upstream CUDA reference does not
+establish non-regression of this branch.
+
+When the historical GLBs are available locally, compare their structure with:
 
 ```bash
 python -m scripts.compare_glb_quality \
   --reference output/pixal3d_main_cuda_a5000_2048_lowvram.glb \
   --candidate output/pixal3d_mps_1536_cuda_parity_final.glb
 ```
-
-Sur ce Mac, la génération neurale 1536 mesurée prend 1 979,85 s et l’export
-final intégré 128,65 s, soit environ 35 min 09 s au total. Le même cas avait
-pris environ 13 min 25 s sur l’A5000.
-
-## Interface
-
-Pour lancer l’interface locale :
-
-```bash
-python app.py --low_vram
-```
-
-Le CLI utilise les convolutions sparse `flex_gemm`, SDPA sur MPS pour les
-longues séquences et le vrai modèle NAF appris. Le noyau d’attention Metal
-fusionné reste disponible, mais il n’est pas retenu par défaut : il régresse
-fortement vers 40 000 tokens malgré ses bons résultats sur les petites
-séquences. Seule l’opération NATTEN CUDA de NAF est remplacée par une
-implémentation MPS équivalente, découpée par lignes. Ces chemins ont des tests
-numériques FP16/BF16 face à leurs références PyTorch.
-
-Les ajouts spécifiques sont listés dans `requirements-macos.txt`. Le setup
-retient la version récente de `utils3d` requise par MoGe ; la wheel 0.0.2
-indiquée dans la fiche Pixal3D est trop ancienne pour cette API.
-`requirements-hfdemo.txt` est réservé au Space Hugging Face et ne doit pas
-être utilisé ici.

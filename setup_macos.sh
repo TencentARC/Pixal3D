@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-if [[ "$(uname -m)" != "arm64" ]]; then
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   echo "Pixal3D Metal setup requires Apple Silicon (arm64)." >&2
   exit 1
 fi

@@ -9,6 +9,7 @@ import base64
 import io
 import json
 from datetime import datetime
+from functools import wraps
 from typing import *
 from PIL import Image
 
@@ -23,10 +24,6 @@ except ImportError:
 init_lock = threading.Lock()
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-os.environ.setdefault("ATTN_BACKEND", "sdpa")
-os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
-os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 from macos_compat import configure
 
@@ -50,8 +47,8 @@ from pixal3d.modules.sparse import SparseTensor
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 from pixal3d.renderers import EnvMap
 from pixal3d.utils import render_utils
-import o_voxel
-from o_voxel import postprocess_cpu
+from backends.export import export_glb
+from backends.memory import release_accelerator_memory
 
 # ============================================================================
 # Constants & Defaults
@@ -115,9 +112,9 @@ IMAGE_COND_CONFIGS = {
 # Model Loading
 # ============================================================================
 
-def build_image_cond_model(config: dict):
+def build_image_cond_model(config: dict, shared_model=None):
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
-    model = DinoV3ProjFeatureExtractor(**config)
+    model = DinoV3ProjFeatureExtractor(**config, shared_model=shared_model)
     model.eval()
     return model
 
@@ -131,7 +128,22 @@ def load_moge_model(device=DEVICE, model_name=MOGE_MODEL_NAME):
 pipeline = None
 moge_model = None
 envmap = None
-LOW_VRAM = os.environ.get("LOW_VRAM", "1") == "1"
+IS_MPS = torch.device(DEVICE).type == "mps"
+LOW_VRAM = os.environ.get("LOW_VRAM", "1" if IS_MPS else "0") == "1"
+_mps_request_lock = threading.RLock()
+
+
+def serialize_mps_request(fn):
+    """Protect model teardown and process-global Metal export patches."""
+    if not IS_MPS:
+        return fn
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _mps_request_lock:
+            return fn(*args, **kwargs)
+    return wrapped
+
 
 def init_models():
     global pipeline, moge_model, envmap
@@ -165,18 +177,27 @@ def init_models():
         
         print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
         pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
-        pipeline.image_cond_model_shape_512 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_512"])
-        pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
-        pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
+        shared_dino = pipeline.image_cond_model_ss.model if IS_MPS else None
+        pipeline.image_cond_model_shape_512 = build_image_cond_model(
+            IMAGE_COND_CONFIGS["shape_512"], shared_model=shared_dino)
+        pipeline.image_cond_model_shape_1024 = build_image_cond_model(
+            IMAGE_COND_CONFIGS["shape_1024"], shared_model=shared_dino)
+        pipeline.image_cond_model_tex_1024 = build_image_cond_model(
+            IMAGE_COND_CONFIGS["tex_1024"], shared_model=shared_dino)
         
         if LOW_VRAM:
             # Low-VRAM mode: models stay on CPU, loaded to GPU on-demand per stage.
             print("[NAF] Pre-downloading NAF upsampler weights (CPU only)...")
+            shared_naf = None
             for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
                          'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
                 m = getattr(pipeline, attr, None)
                 if m is not None and getattr(m, 'use_naf_upsample', False):
-                    m._load_naf()
+                    if shared_naf is None or not IS_MPS:
+                        m._load_naf()
+                        shared_naf = m.naf_model
+                    else:
+                        m.naf_model = shared_naf
             pipeline._device = torch.device(DEVICE)
             pipeline.low_vram = True
             print("[Pipeline] Low-VRAM mode enabled.")
@@ -189,11 +210,16 @@ def init_models():
             pipeline.image_cond_model_shape_1024.to(DEVICE)
             pipeline.image_cond_model_tex_1024.to(DEVICE)
             print("[NAF] Pre-loading NAF upsampler model...")
+            shared_naf = None
             for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
                          'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
                 m = getattr(pipeline, attr, None)
                 if m is not None and getattr(m, 'use_naf_upsample', False):
-                    m._load_naf()
+                    if shared_naf is None or not IS_MPS:
+                        m._load_naf()
+                        shared_naf = m.naf_model
+                    else:
+                        m.naf_model = shared_naf
                 
         print("[MoGe-2] Loading model for camera estimation...")
         if LOW_VRAM:
@@ -381,6 +407,7 @@ async def progress_poll(request: Request):
 
 @app.api()
 @spaces.GPU(duration=30)
+@serialize_mps_request
 def preprocess(image: FileData) -> FileData:
     init_models()
     img = Image.open(image["path"])
@@ -391,6 +418,7 @@ def preprocess(image: FileData) -> FileData:
 
 @app.api()
 @spaces.GPU(duration=120)
+@serialize_mps_request
 def generate_3d(
     image: FileData, 
     seed: int, 
@@ -516,24 +544,51 @@ def generate_3d(
 
 @app.api()
 @spaces.GPU(duration=240)
+@serialize_mps_request
 def extract_glb_api(state_path: str, decimation_target: int, texture_size: int, session_id: str = "") -> FileData:
+    global pipeline, moge_model, envmap
     init_models()
     _reset_progress(session_id)
     _update_progress("Decoding latent", 0, 1)
-    
+
     shape_slat, tex_slat, res = unpack_state(state_path)
-    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+    attr_layout = dict(pipeline.pbr_attr_layout)
+    if IS_MPS:
+        # Keep only the two decoders, then release them as each stage finishes.
+        # The next neural request lazily reloads the pipeline. The request lock
+        # prevents another request from using this partially released pipeline.
+        for name in tuple(pipeline.models):
+            if name not in {"shape_slat_decoder", "tex_slat_decoder"}:
+                del pipeline.models[name]
+        for name in (
+            "image_cond_model_ss", "image_cond_model_shape_512",
+            "image_cond_model_shape_1024", "image_cond_model_tex_1024",
+            "rembg_model",
+        ):
+            setattr(pipeline, name, None)
+        moge_model = envmap = None
+        release_accelerator_memory("web export: non-decoder models released", verbose=True)
+        try:
+            mesh = pipeline.decode_latent(
+                shape_slat, tex_slat, res,
+                release_models=True, output_device="cpu",
+            )[0]
+        finally:
+            pipeline = None
+            release_accelerator_memory("web export: decoders released", verbose=True)
+    else:
+        mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+    del shape_slat, tex_slat
     _update_progress("Decoding latent", 1, 1)
-    
-    # Use the portable macOS exporter: the Metal cumesh remesher can stall on
-    # large decoded meshes. Keep the web demo responsive with a bounded profile.
-    glb = postprocess_cpu.to_glb(
+    _update_progress("Exporting GLB", 0, 1)
+
+    # Same device-aware high-quality defaults as the CLI, with no hidden caps.
+    glb = export_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=min(decimation_target, 50000),
-        texture_size=min(texture_size, 256),
-        remesh=False, remesh_band=1, remesh_project=0, use_tqdm=True,
+        coords=mesh.coords, attr_layout=attr_layout,
+        resolution=res, device=DEVICE,
+        decimation_target=decimation_target, texture_size=texture_size,
+        use_tqdm=True,
     )
     rot = np.array([
         [-1,  0,  0,  0],

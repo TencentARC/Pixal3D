@@ -10,12 +10,15 @@ from typing import Any
 def memory_snapshot() -> dict[str, float]:
     """Return current process and MPS memory counters in GiB."""
 
-    import psutil
     import torch
 
-    snapshot = {
-        "rss_gib": psutil.Process(os.getpid()).memory_info().rss / 1024**3,
-    }
+    snapshot = {}
+    try:
+        import psutil
+    except ImportError:
+        pass  # Optional diagnostics must not make CUDA depend on macOS extras.
+    else:
+        snapshot["rss_gib"] = psutil.Process(os.getpid()).memory_info().rss / 1024**3
     if torch.backends.mps.is_available():
         snapshot.update(
             {
@@ -44,7 +47,9 @@ def release_accelerator_memory(
         torch.mps.empty_cache()
     elif torch.cuda.is_available():
         torch.cuda.empty_cache()
-    snapshot = memory_snapshot()
+    # Diagnostics are optional; the normal CUDA path must not acquire an
+    # extra dependency on the macOS-only psutil requirement.
+    snapshot = memory_snapshot() if verbose else {}
     if verbose and label:
         values = ", ".join(
             f"{name.removesuffix('_gib')}={value:.2f} GiB"

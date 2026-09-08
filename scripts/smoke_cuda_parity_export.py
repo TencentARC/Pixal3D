@@ -12,9 +12,9 @@ import trimesh
 
 from macos_compat import configure
 
-configure()
+DEVICE = configure()
 
-from backends.cuda_parity_export import to_glb_cuda_parity
+from backends.export import export_glb
 
 
 def main() -> None:
@@ -51,7 +51,9 @@ def main() -> None:
         ],
         dim=1,
     )
-    result = to_glb_cuda_parity(
+    result = export_glb(
+        device=DEVICE,
+        profile="cuda-parity",
         vertices=vertices,
         faces=faces,
         attr_volume=attrs,

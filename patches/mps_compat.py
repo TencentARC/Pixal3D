@@ -1,164 +1,23 @@
-"""Apply the small source changes needed by Pixal3D on Apple Silicon.
+"""Patch only the pinned third-party Metal o_voxel installation.
 
-The upstream project assumes CUDA.  The actual Metal kernels are installed by
-``setup_macos.sh``; this script wires them into Pixal3D and installs the
-portable mesh-extraction fallback used by the TRELLIS.2 macOS port.
+Pixal3D's device-aware source changes are tracked in git. Setup must not
+rewrite them: doing so could reintroduce unconditional macOS overrides.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
 from pathlib import Path
-
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def read(path: str) -> str:
-    with open(path, encoding="utf-8") as handle:
-        return handle.read()
-
-
-def write(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    print(f"  patched {os.path.relpath(path, ROOT)}")
-
-
-def replace_once(path: str, old: str, new: str, label: str) -> None:
-    text = read(path)
-    if new in text:
-        print(f"  already patched {label}")
-        return
-    if old not in text:
-        raise RuntimeError(f"Could not find patch anchor for {label}: {path}")
-    write(path, text.replace(old, new, 1))
-
-
-def patch_pipeline_base() -> None:
-    path = os.path.join(ROOT, "pixal3d/pipelines/base.py")
-    replace_once(
-        path,
-        '        self.to(torch.device("cuda"))',
-        '        self.to(torch.device("mps") if torch.backends.mps.is_available() else torch.device("cuda"))',
-        "Pipeline.cuda()",
-    )
-
-
-def patch_birefnet() -> None:
-    path = os.path.join(ROOT, "pixal3d/pipelines/rembg/BiRefNet.py")
-    text = read(path)
-    if "def device(self)" not in text:
-        text = text.replace(
-            "    def to(self, device: str):\n        self.model.to(device)\n\n    def cuda(self):",
-            "    @property\n    def device(self):\n        return next(self.model.parameters()).device\n\n    def to(self, device: str):\n        self.model.to(device)\n        return self\n\n    def cuda(self):",
-            1,
-        )
-    text = text.replace('.unsqueeze(0).to("cuda")', ".unsqueeze(0).to(self.device)")
-    write(path, text)
-
-
-def patch_image_extractors() -> None:
-    for relative in (
-        "pixal3d/modules/image_feature_extractor.py",
-    ):
-        path = os.path.join(ROOT, relative)
-        text = read(path)
-        text = text.replace(".cuda()", ".to(self.device)")
-        if relative.endswith("image_feature_extractor.py"):
-            property_block = (
-                "    @property\n"
-                "    def device(self):\n"
-                "        return next(self.model.parameters()).device\n\n"
-            )
-            first_anchor = "class DinoV2FeatureExtractor:"
-            second_anchor = "class DinoV3FeatureExtractor:"
-            for anchor in (first_anchor, second_anchor):
-                start = text.index(anchor)
-                end = text.find("\nclass ", start + len(anchor))
-                if end == -1:
-                    end = len(text)
-                block = text[start:end]
-                if "def device(self)" not in block:
-                    block = block.replace(
-                        "    def to(self, device):\n",
-                        property_block + "    def to(self, device):\n",
-                        1,
-                    )
-                    text = text[:start] + block + text[end:]
-        write(path, text)
-
-
-def patch_varlen_reduce() -> None:
-    path = os.path.join(ROOT, "pixal3d/modules/sparse/basic.py")
-    text = read(path)
-    marker = "pixal3d-macos: MPS segment reduce"
-    if marker in text:
-        print("  already patched pixal3d/modules/sparse/basic.py")
-        return
-    old = "        red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)\n        return red"
-    new = """        # pixal3d-macos: MPS segment reduce.  The layout is authoritative;
-        # cached lengths can describe a previous cascade scale.
-        lengths = self.seqlen
-        if int(lengths.sum().item()) != red.shape[0]:
-            lengths = torch.tensor(
-                [s.stop - s.start for s in self.layout],
-                dtype=torch.long,
-                device=red.device,
-            )
-        if int(lengths.sum().item()) != red.shape[0]:
-            raise RuntimeError("Sparse VarLenTensor has inconsistent segment lengths")
-        if red.device.type == 'mps':
-            return torch.segment_reduce(
-                red.cpu(), reduce=op, lengths=lengths.cpu()
-            ).to(red.device)
-        return torch.segment_reduce(red, reduce=op, lengths=lengths)"""
-    replace_once(path, old, new, marker)
-
-
-def patch_fdg_vae() -> None:
-    path = os.path.join(ROOT, "pixal3d/models/sc_vaes/fdg_vae.py")
-    old = "from o_voxel.convert import flexible_dual_grid_to_mesh\n"
-    new = """# The Metal o_voxel converter is not reliable for decoder output on every
-# macOS/PyTorch combination. Prefer the portable implementation shipped in
-# backends/mesh_extract.py; the Metal postprocess module remains available for
-# textured GLB export.
-import sys as _sys
-_stubs = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'stubs')
-if _stubs not in _sys.path:
-    _sys.path.append(_stubs)
-from o_voxel_override_convert import flexible_dual_grid_to_mesh
-"""
-    replace_once(path, old, new, "pure-Python dual-grid mesh extraction")
-
-
-def install_backends() -> None:
-    source = os.path.join(ROOT, "backends/conv_none.py")
-    target = os.path.join(ROOT, "pixal3d/modules/sparse/conv/conv_none.py")
-    if not os.path.exists(target):
-        shutil.copy2(source, target)
-        print("  installed pixal3d/modules/sparse/conv/conv_none.py")
-
-    stubs = os.path.join(ROOT, "stubs")
-    shutil.copy2(
-        os.path.join(ROOT, "backends/mesh_extract.py"),
-        os.path.join(stubs, "o_voxel_override_convert.py"),
-    )
-    shutil.copy2(
-        os.path.join(ROOT, "backends/mesh_extract.py"),
-        os.path.join(stubs, "o_voxel/convert.py"),
-    )
-    print("  installed portable o_voxel converter")
 
 
 def patch_o_voxel() -> None:
     """Install the tracked Metal post-processing compatibility changes."""
     try:
         import o_voxel.postprocess as postprocess
-    except ImportError:
-        return
+    except ImportError as exc:
+        raise RuntimeError("Install the pinned Metal o_voxel before applying patches") from exc
+    if getattr(postprocess, "_BACKEND", None) != "metal":
+        raise RuntimeError("Refusing to patch a non-Metal o_voxel installation")
     path = Path(postprocess.__file__)
     text = path.read_text(encoding="utf-8")
     call = "mesh.fill_holes(max_hole_perimeter=3e-2)"
@@ -399,12 +258,6 @@ def patch_o_voxel() -> None:
 
 def main() -> None:
     print("Applying Pixal3D macOS/MPS compatibility patches...")
-    patch_pipeline_base()
-    patch_birefnet()
-    patch_image_extractors()
-    patch_varlen_reduce()
-    patch_fdg_vae()
-    install_backends()
     patch_o_voxel()
     print("All Pixal3D macOS patches applied.")
 

@@ -447,12 +447,12 @@ class DinoV3ProjFeatureExtractor(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def cuda(self):
-        super().to(self.device)
-        self.model.to(self.device)
-        self.proj_grid.to(self.device)
+    def cuda(self, device=None):
+        super().cuda(device=device)
+        self.model.cuda(device=device)
+        self.proj_grid.cuda(device=device)
         if self.naf_model is not None:
-            self.naf_model.to(self.device)
+            self.naf_model.cuda(device=device)
         return self
 
     def cpu(self):
@@ -712,12 +712,12 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def cuda(self):
-        super().to(self.device)
-        self.dino_model.to(self.device)
-        self.proj_grid.to(self.device)
+    def cuda(self, device=None):
+        super().cuda(device=device)
+        self.dino_model.cuda(device=device)
+        self.proj_grid.cuda(device=device)
         if self._vae is not None:
-            self._vae.to(self.device)
+            self._vae.cuda(device=device)
         return self
     
     def cpu(self):
