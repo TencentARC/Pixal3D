@@ -464,6 +464,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         grid_resolution: int = 16,
         use_naf_upsample: bool = False,
         naf_target_size: Optional[List[int]] = None,
+        shared_model: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.model_name = model_name
@@ -478,7 +479,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             self.naf_target_size = tuple(naf_target_size)
         
         # Load DINOv3 model (frozen, no trainable params in this module)
-        self.model = DINOv3ViTModel.from_pretrained(model_name)
+        self.model = (
+            shared_model
+            if shared_model is not None
+            else DINOv3ViTModel.from_pretrained(model_name)
+        )
         self.model.eval()
         self.model.requires_grad_(False)
         
@@ -516,6 +521,13 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             self.naf_model = torch.hub.load(
                 "valeoai/NAF", "naf", pretrained=True, device=device, trust_repo=True
             )
+            # Preserve the learned NAF upsampler on Apple Silicon.  Only its
+            # CUDA-only NATTEN operation is replaced by an equivalent,
+            # row-chunked PyTorch/MPS implementation.
+            if device.type == "mps" or not torch.cuda.is_available():
+                from backends.naf_attention import install_chunked_naf_attention
+
+                install_chunked_naf_attention(self.naf_model)
             self.naf_model.eval()
             self.naf_model.requires_grad_(False)
         
@@ -527,12 +539,16 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             self.naf_model.to(device)
         return self
 
-    def cuda(self):
-        super().cuda()
-        self.model.cuda()
-        self.proj_grid.cuda()
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def cuda(self, device=None):
+        super().cuda(device=device)
+        self.model.cuda(device=device)
+        self.proj_grid.cuda(device=device)
         if self.naf_model is not None:
-            self.naf_model.cuda()
+            self.naf_model.cuda(device=device)
         return self
 
     def cpu(self):
@@ -589,7 +605,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -934,12 +950,16 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
             self._vae.to(device)
         return self
     
-    def cuda(self):
-        super().cuda()
-        self.dino_model.cuda()
-        self.proj_grid.cuda()
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def cuda(self, device=None):
+        super().cuda(device=device)
+        self.dino_model.cuda(device=device)
+        self.proj_grid.cuda(device=device)
         if self._vae is not None:
-            self._vae.cuda()
+            self._vae.cuda(device=device)
         return self
     
     def cpu(self):
@@ -998,7 +1018,7 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(self.device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -1078,7 +1098,7 @@ class ImageConditionedProjMixin:
                 from . import image_conditioned
                 self.image_cond_model = getattr(image_conditioned, model_name)(**model_args)
             
-            self.image_cond_model.cuda()
+            self.image_cond_model.to(self.device)
             
             # Expose proj_channels for denoiser to know the correct proj_in_channels
             if hasattr(self.image_cond_model, 'proj_channels'):

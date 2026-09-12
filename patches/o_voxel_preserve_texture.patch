@@ -1,0 +1,44 @@
+diff --git a/o-voxel/o_voxel/postprocess.py b/o-voxel/o_voxel/postprocess.py
+index 1f16265..b432f15 100644
+--- a/o-voxel/o_voxel/postprocess.py
++++ b/o-voxel/o_voxel/postprocess.py
+@@ -93,0 +94 @@ def to_glb(
++    reproject_texture_to_source: bool = True,
+@@ -116,0 +118,3 @@ def to_glb(
++        reproject_texture_to_source: project UV texels back to the input mesh
++            before sampling attributes. Disable only when post-processing is
++            guaranteed to preserve the input geometry exactly.
+@@ -198 +202,4 @@ def to_glb(
+-    # Build BVH for the current mesh to guide remeshing
++    # A BVH is needed only when remeshing or projecting UV texels back to the
++    # source surface. Preserve mode does neither, so avoid a redundant and
++    # potentially fragile build on dense/non-manifold geometry.
++    needs_bvh = remesh or reproject_texture_to_source
+@@ -200 +207 @@ def to_glb(
+-        pbar.set_description("Building BVH")
++        pbar.set_description("Building BVH" if needs_bvh else "Skipping BVH")
+@@ -202,2 +209,3 @@ def to_glb(
+-        print(f"Building BVH for current mesh...", end='', flush=True)
+-    bvh = _BVH(vertices, faces)
++        action = "Building" if needs_bvh else "Skipping"
++        print(f"{action} BVH for current mesh...", end='', flush=True)
++    bvh = _BVH(vertices, faces) if needs_bvh else None
+@@ -341,5 +349,9 @@ def to_glb(
+-    # Map these positions back to the *original* high-res mesh to get accurate attributes
+-    # This corrects geometric errors introduced by simplification/remeshing
+-    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+-    orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
+-    valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
++    # Map these positions back to the *original* high-res mesh to get accurate
++    # attributes after simplification/remeshing. Geometry-preserving callers
++    # should skip this projection: valid_pos already lies on the immutable
++    # input triangles, while a second closest-point query can jump between
++    # nearby or overlapping non-manifold sheets.
++    if reproject_texture_to_source:
++        _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
++        orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
++        valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+@@ -427 +439 @@ def to_glb(
+-    return textured_mesh
+\ No newline at end of file
++    return textured_mesh

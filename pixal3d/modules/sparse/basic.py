@@ -280,8 +280,22 @@ class VarLenTensor:
         if dim is None or 0 in dim:
             return red
         
-        red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)
-        return red
+        # pixal3d-macos: MPS segment reduce.  The layout is authoritative;
+        # cached lengths can describe a previous cascade scale.
+        lengths = self.seqlen
+        if int(lengths.sum().item()) != red.shape[0]:
+            lengths = torch.tensor(
+                [s.stop - s.start for s in self.layout],
+                dtype=torch.long,
+                device=red.device,
+            )
+        if int(lengths.sum().item()) != red.shape[0]:
+            raise RuntimeError("Sparse VarLenTensor has inconsistent segment lengths")
+        if red.device.type == 'mps':
+            return torch.segment_reduce(
+                red.cpu(), reduce=op, lengths=lengths.cpu()
+            ).to(red.device)
+        return torch.segment_reduce(red, reduce=op, lengths=lengths)
     
     def mean(self, dim: Optional[Union[int, Tuple[int,...]]] = None, keepdim: bool = False) -> torch.Tensor:
         return self.reduce(op='mean', dim=dim, keepdim=keepdim)

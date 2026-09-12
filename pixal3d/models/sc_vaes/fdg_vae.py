@@ -17,7 +17,7 @@ from .sparse_unet_vae import (
     SparseUnetVaeDecoder,
 )
 from ...representations import Mesh
-from o_voxel.convert import flexible_dual_grid_to_mesh
+from backends.mesh_conversion import flexible_dual_grid_to_mesh
 
 
 class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):

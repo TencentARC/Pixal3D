@@ -24,3 +24,12 @@ env/
 Thumbs.db
 
 tmp
+__pycache__/
+.venv/
+deps/
+autotune_cache.json
+output/
+*.glb
+tmp/
+runpod/*.tar.gz
+RUNPOD_SESSION.md

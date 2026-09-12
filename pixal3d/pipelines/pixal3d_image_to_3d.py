@@ -8,6 +8,7 @@ from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
+from backends.memory import drop_model, release_accelerator_memory
 
 
 class Pixal3DImageTo3DPipeline(Pipeline):
@@ -41,7 +42,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         'shape_slat_flow_model_512',
         'shape_slat_flow_model_1024',
         'shape_slat_decoder',
-        'tex_slat_flow_model_512',
         'tex_slat_flow_model_1024',
         'tex_slat_decoder',
     ]
@@ -577,6 +577,9 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         shape_slat: SparseTensor,
         tex_slat: SparseTensor,
         resolution: int,
+        *,
+        release_models: bool = False,
+        output_device: Optional[Union[str, torch.device]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Decode the latent codes.
@@ -587,21 +590,50 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             resolution (int): The resolution of the output.
         """
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+        if release_models:
+            drop_model(self, 'shape_slat_decoder')
+            release_accelerator_memory(
+                "shape decoder released",
+                verbose=True,
+            )
+
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
+        if release_models:
+            drop_model(self, 'tex_slat_decoder')
+            release_accelerator_memory(
+                "texture decoder released",
+                verbose=True,
+            )
+
         out_mesh = []
         torch.cuda.synchronize()
         for m, v in zip(meshes, tex_voxels):
             m.fill_holes()
+            vertices = m.vertices
+            faces = m.faces
+            coords = v.coords[:, 1:]
+            attrs = v.feats
+            if output_device is not None:
+                vertices = vertices.to(output_device)
+                faces = faces.to(output_device)
+                coords = coords.to(output_device)
+                attrs = attrs.to(output_device)
             out_mesh.append(
                 MeshWithVoxel(
-                    m.vertices, m.faces,
+                    vertices, faces,
                     origin = [-0.5, -0.5, -0.5],
                     voxel_size = 1 / resolution,
-                    coords = v.coords[:, 1:],
-                    attrs = v.feats,
+                    coords = coords,
+                    attrs = attrs,
                     voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
                     layout=self.pbr_attr_layout
                 )
+            )
+        if output_device is not None:
+            del meshes, tex_voxels, subs
+            release_accelerator_memory(
+                f"decoded output moved to {output_device}",
+                verbose=release_models,
             )
         return out_mesh
     
@@ -619,6 +651,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        release_models: bool = False,
+        output_device: Optional[Union[str, torch.device]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the Pixal3D pipeline (proj mode, cascade).
@@ -638,6 +672,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            release_models (bool): Permanently discard one-shot models after
+                their final stage. Intended for single-image inference.
+            output_device: Move decoded mesh and voxel attributes to this
+                device before returning. ``"cpu"`` frees unified GPU memory
+                before native remeshing and texture baking.
         """
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
@@ -677,13 +716,21 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             distance=distance,
             mesh_scale=mesh_scale,
         )
+        if release_models:
+            self.image_cond_model_ss = None
         ss_res = 32
         coords = self.sample_sparse_structure(
             cond_ss, ss_res,
             num_samples, sparse_structure_sampler_params
         )
         del cond_ss
-        torch.cuda.empty_cache()
+        if release_models:
+            drop_model(self, 'sparse_structure_flow_model')
+            drop_model(self, 'sparse_structure_decoder')
+        release_accelerator_memory(
+            "sparse-structure stage released",
+            verbose=release_models,
+        )
 
         # ---- Stage 2: Shape LR 512 (proj) ----
         cond_shape_lr = self.get_proj_cond_shape(
@@ -692,12 +739,19 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             distance=distance,
             mesh_scale=mesh_scale,
         )
+        if release_models:
+            self.image_cond_model_shape_512 = None
         lr_slat = self.sample_shape_slat(
             cond_shape_lr, self.models['shape_slat_flow_model_512'],
             coords, shape_slat_sampler_params
         )
         del cond_shape_lr
-        torch.cuda.empty_cache()
+        if release_models:
+            drop_model(self, 'shape_slat_flow_model_512')
+        release_accelerator_memory(
+            "low-resolution shape stage released",
+            verbose=release_models,
+        )
 
         # ---- Stage 3a: Upsample LR → HR ----
         if self.low_vram:
@@ -724,7 +778,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         actual_grid_res = actual_hr_resolution // 16
         del lr_slat, hr_coords, quant_coords
-        torch.cuda.empty_cache()
+        release_accelerator_memory(
+            "shape-coordinate upsample released",
+            verbose=release_models,
+        )
 
         # ---- Stage 3b: Shape HR (proj) ----
         cond_shape_hr = self.get_proj_cond_shape(
@@ -734,6 +791,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             mesh_scale=mesh_scale,
             grid_resolution_override=actual_grid_res,
         )
+        if release_models:
+            self.image_cond_model_shape_1024 = None
         noise_hr = SparseTensor(
             feats=torch.randn(hr_coords_unique.shape[0], self.models['shape_slat_flow_model_1024'].in_channels).to(self.device),
             coords=hr_coords_unique,
@@ -755,8 +814,21 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(hr_slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(hr_slat.device)
         shape_slat = hr_slat * std + mean
-        del cond_shape_hr, noise_hr, hr_slat, hr_coords_unique
-        torch.cuda.empty_cache()
+        del (
+            cond_shape_hr,
+            noise_hr,
+            hr_slat,
+            hr_coords_unique,
+            flow_model_hr,
+            std,
+            mean,
+        )
+        if release_models:
+            drop_model(self, 'shape_slat_flow_model_1024')
+        release_accelerator_memory(
+            "high-resolution shape stage released",
+            verbose=release_models,
+        )
 
         # ---- Stage 4: Texture (proj) ----
         tex_grid_res = actual_hr_resolution // 16
@@ -767,17 +839,35 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             mesh_scale=mesh_scale,
             grid_resolution_override=tex_grid_res,
         )
+        if release_models:
+            self.image_cond_model_tex_1024 = None
         tex_slat = self.sample_tex_slat(
             cond_tex, self.models['tex_slat_flow_model_1024'],
             shape_slat, tex_slat_sampler_params
         )
         del cond_tex
-        torch.cuda.empty_cache()
+        if release_models:
+            drop_model(self, 'tex_slat_flow_model_1024')
+        release_accelerator_memory(
+            "texture-flow stage released",
+            verbose=release_models,
+        )
 
         # ---- Stage 5: Decode ----
         res = actual_hr_resolution
-        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        out_mesh = self.decode_latent(
+            shape_slat,
+            tex_slat,
+            res,
+            release_models=release_models,
+            output_device=output_device,
+        )
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
         else:
+            del shape_slat, tex_slat
+            release_accelerator_memory(
+                "latent tensors released",
+                verbose=release_models,
+            )
             return out_mesh

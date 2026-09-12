@@ -56,6 +56,9 @@ You can try Pixal3D directly in your browser without any installation via our Hu
 
 ### Installation
 
+For the experimental Apple Silicon/MPS inference port, use the separate
+[macOS setup and validation guide](README_MACOS.md). The steps below target CUDA.
+
 #### Step 1: Follow TRELLIS.2 Installation
 
 Please first follow the installation guide of [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) to set up the base environment.
@@ -339,4 +342,3 @@ If you find this work useful, please consider citing:
 ## 📜 License
 
 This project is released under the [MIT License](LICENSE). The third-party components included in this project remain licensed under their respective original terms; see [NOTICE](NOTICE) for the full list of dependencies and their licenses.
-

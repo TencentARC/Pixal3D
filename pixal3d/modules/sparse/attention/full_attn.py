@@ -229,6 +229,34 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             max_q_seqlen = max(q_seqlen)
             max_kv_seqlen = max(kv_seqlen)
         out, _ = flash_attn_4_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_q_seqlen, max_kv_seqlen)
+    elif config.ATTN == 'flex_gemm_sparse_attn':
+        # Metal flash-attention-v2 kernel from mtlgemm.  Its packed variable
+        # length interface is equivalent to flash_attn's CUDA interface and
+        # avoids padding every sparse window into a dense SDPA batch.
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+
+        import math
+        import flex_gemm
+
+        cu_seqlens_q = torch.cat(
+            [torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]
+        ).int().to(device)
+        cu_seqlens_kv = torch.cat(
+            [torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]
+        ).int().to(device)
+        out = flex_gemm.kernels.cuda.sparse_attention_fwd(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max(q_seqlen),
+            max(kv_seqlen),
+            1.0 / math.sqrt(q.shape[-1]),
+        )
     elif config.ATTN == 'sdpa':
         from torch.nn.functional import scaled_dot_product_attention as _sdpa
         if num_all_args == 1:
