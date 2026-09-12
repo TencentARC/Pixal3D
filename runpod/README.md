@@ -28,3 +28,28 @@ tar -xzf pixal3d-cuda-extras.tar.gz -C "$SITE"
 ```
 
 Le fichier de lock contient quelques références locales au pod (`file:///tmp/...` et `file:///workspace/...`) ; il sert de référence et de contrôle, mais ne doit pas être utilisé tel quel comme unique commande `pip install -r`.
+
+## Restore checks found during CUDA validation (2026-09-12)
+
+The original extras archive omits the top-level
+`_nvdiffrast_c.cpython-311-x86_64-linux-gnu.so` extension. Extracting only the
+two original archives is therefore insufficient. A complete replacement,
+`pixal3d-nvdiffrast-complete-torch260-cu128-sm86.tar.gz`, is retained locally
+and must be extracted **after** the original extras archive.
+
+This replacement was built from NVIDIA nvdiffrast v0.4.0
+(`253ac4fcea7de5f396371124af597e6cc957bfae`) with Python 3.11, PyTorch
+2.6.0+cu124, the CUDA 12.8 compiler and `TORCH_CUDA_ARCH_LIST=8.6`.
+Its tested target is an A40 with driver 580.159.04; compatibility with other
+architectures or older drivers is not established.
+
+SHA-256: `ce0dd6009d504570bc07b393b78e66b53dca0141cf5e35deb3d8a5bbc709cb2e`.
+
+MoGe's pinned package metadata requests a different `utils3d` source than
+the saved environment. When restoring with `uv`, explicitly override that
+dependency with the `utils3d` wheel recorded in the lock, and pin PyTorch
+and torchvision to their saved CUDA versions.
+
+Do not copy an entire Hugging Face home directory to a pod: it can contain
+personal access tokens. Transfer only specifically authorized model files
+when a required gated model cannot be downloaded anonymously.

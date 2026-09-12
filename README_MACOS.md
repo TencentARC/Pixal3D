@@ -171,9 +171,21 @@ python app.py --help
 ```
 
 The export smoke test uses a small synthetic mesh, a 32³ grid and 128px texture.
-It is not a full-resolution quality benchmark. **This revised branch still
-needs an end-to-end NVIDIA run**; the older upstream CUDA reference does not
-establish non-regression of this branch.
+It is not a full-resolution quality benchmark.
+
+**End-to-end NVIDIA validation passed on 2026-09-12**, using this revised
+branch (`0660b18`) on an A40, PyTorch 2.6.0+cu124, seed 42 and the same input.
+The actual 1536 cascade and native CUDA export completed in 540.82 s including
+model initialization: 960,451 faces, 4096² texture, opaque single-sided material,
+99.77% dominant surface and 3 boundary edges. All eight existing structural
+comparison checks passed against the historical upstream CUDA GLB. The 49-test
+suite also passed on the NVIDIA host.
+
+See the [CUDA validation report](docs/CUDA_VALIDATION.md) for exact settings,
+timings, environment and limitations. This is a single-case compatibility and
+structural check, not proof of identical output, universal quality parity or a
+watertight/print-ready mesh. No new full MPS generation was performed in this
+validation pass.
 
 When the historical GLBs are available locally, compare their structure with:
 
