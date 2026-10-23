@@ -1,4 +1,4 @@
-git+https://github.com/microsoft/MoGe.git
+git+https://github.com/microsoft/MoGe.git@925b8ed835a7a9cdb7578ba15c658a0afc969030
 pillow==12.0.0
 imageio==2.37.2
 imageio-ffmpeg==0.6.0
